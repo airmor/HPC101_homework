@@ -20,8 +20,8 @@ void preprocess(MoEWeights& w) {
 
     float* w_router_transpose = new float[w.num_experts * w.d_model];
     for (int e = 0; e < w.num_experts; e+=16) {
-        for (int d = 0; d < w.d_model; d++) {
-            for (int i = 0; i < 16; i++) {
+        for (int d = 0; d < w.d_model; ++d) {
+            for (int i = 0; i < 16; ++i) {
                 w_router_transpose[e * w.d_model + d * 16 + i] = w.w_router[e * w.d_model + i * w.d_model + d];
             }
         }
@@ -36,8 +36,8 @@ void preprocess(MoEWeights& w) {
 
     int8_t* w_sh_gate_transpose = new int8_t[w.d_ff * w.d_model];
     for (int f = 0; f < w.d_ff; f+=16) {
-        for (int d = 0; d < w.d_model; d++) {
-            for (int i = 0; i < 16; i++) {
+        for (int d = 0; d < w.d_model; ++d) {
+            for (int i = 0; i < 16; ++i) {
                 w_sh_gate_transpose[f * w.d_model + d * 16 + i] = w.sh_gate[f * w.d_model + i * w.d_model + d];
             }
         }
@@ -52,8 +52,8 @@ void preprocess(MoEWeights& w) {
 
     int8_t* w_sh_up_transpose = new int8_t[w.d_ff * w.d_model];
     for (int f = 0; f < w.d_ff; f+=16) {
-        for (int d = 0; d < w.d_model; d++) {
-            for (int i = 0; i < 16; i++) {
+        for (int d = 0; d < w.d_model; ++d) {
+            for (int i = 0; i < 16; ++i) {
                 w_sh_up_transpose[f * w.d_model + d * 16 + i] = w.sh_up[f * w.d_model + i * w.d_model + d];
             }
         }
@@ -68,8 +68,8 @@ void preprocess(MoEWeights& w) {
 
     int8_t* w_sh_down_transpose = new int8_t[w.d_model * w.d_ff];
     for (int d = 0; d < w.d_model; d+=16) {
-        for (int f = 0; f < w.d_ff; f++) {
-            for (int i = 0; i < 16; i++) {
+        for (int f = 0; f < w.d_ff; ++f) {
+            for (int i = 0; i < 16; ++i) {
                 w_sh_down_transpose[d * w.d_ff + f * 16 + i] = w.sh_down[d * w.d_ff + i * w.d_ff + f];
             }
         }
@@ -83,10 +83,10 @@ void preprocess(MoEWeights& w) {
     // | /-- | -> | //| |
 
     int8_t* w_gate_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
-    for (int e = 0; e < w.num_experts; e++) {
+    for (int e = 0; e < w.num_experts; ++e) {
         for (int f = 0; f < w.d_ff; f+=16) {
-            for (int d = 0; d < w.d_model; d++) {
-                for (int i = 0; i < 16; i++) {
+            for (int d = 0; d < w.d_model; ++d) {
+                for (int i = 0; i < 16; ++i) {
                     w_gate_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_gate[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
                 }
             }
@@ -101,10 +101,10 @@ void preprocess(MoEWeights& w) {
     // | /-- | -> | //| |
 
     int8_t* w_up_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
-    for (int e = 0; e < w.num_experts; e++) {
+    for (int e = 0; e < w.num_experts; ++e) {
         for (int f = 0; f < w.d_ff; f+=16) {
-            for (int d = 0; d < w.d_model; d++) {
-                for (int i = 0; i < 16; i++) {
+            for (int d = 0; d < w.d_model; ++d) {
+                for (int i = 0; i < 16; ++i) {
                     w_up_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_up[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
                 }
             }
@@ -119,10 +119,10 @@ void preprocess(MoEWeights& w) {
     // | /-- | -> | //| |
 
     int8_t* w_down_transpose = new int8_t[(size_t)w.num_experts * w.d_model * w.d_ff];
-    for (int e = 0; e < w.num_experts; e++) {
+    for (int e = 0; e < w.num_experts; ++e) {
         for (int d = 0; d < w.d_model; d+=16) {
-            for (int f = 0; f < w.d_ff; f++) {
-                for (int i = 0; i < 16; i++) {
+            for (int f = 0; f < w.d_ff; ++f) {
+                for (int i = 0; i < 16; ++i) {
                     w_down_transpose[(size_t)e * w.d_model * w.d_ff + (size_t)d * w.d_ff + f * 16 + i] = w.w_down[(size_t)e * w.d_model * w.d_ff + (size_t)(d + i) * w.d_ff + f];
                 }
             }
@@ -198,20 +198,23 @@ static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
         __m512i acc_g = _mm512_setzero_epi32();
         __m512i acc_u = _mm512_setzero_epi32();
         for (int d = 0; d < d_model; ++d) {
-            __m512i w_gate_vec = _mm512_loadu_epi32(&w_gate[f * d_model + d * 16]);
-            __m512i w_up_vec = _mm512_loadu_epi32(&w_up[f * d_model + d * 16]);
-            __m512i xq_vec = _mm512_set1_epi32(xq[d]);
-            acc_g = _mm512_add_epi32(acc_g, _mm512_mul_epi32(w_gate_vec, xq_vec));
-            acc_u = _mm512_add_epi32(acc_u, _mm512_mul_epi32(w_up_vec, xq_vec));
+            // Load 16 int8 weights, sign-extend to int32
+            __m128i w_gate_16 = _mm_loadu_si128((const __m128i*)&w_gate[f * d_model + d * 16]);
+            __m128i w_up_16   = _mm_loadu_si128((const __m128i*)&w_up  [f * d_model + d * 16]);
+            __m512i w_gate_i32 = _mm512_cvtepi8_epi32(w_gate_16);
+            __m512i w_up_i32   = _mm512_cvtepi8_epi32(w_up_16);
+            __m512i xq_i32 = _mm512_set1_epi32((int32_t)xq[d]);
+            acc_g = _mm512_add_epi32(acc_g, _mm512_mullo_epi32(w_gate_i32, xq_i32));
+            acc_u = _mm512_add_epi32(acc_u, _mm512_mullo_epi32(w_up_i32,   xq_i32));
         }
         __m512 s_x_mul_gate = _mm512_set1_ps(s_x * s_gate);
         __m512 s_x_mul_up = _mm512_set1_ps(s_x * s_up);
         __m512 vg = _mm512_mul_ps(s_x_mul_gate, _mm512_cvtepi32_ps(acc_g));
         __m512 vu = _mm512_mul_ps(s_x_mul_up, _mm512_cvtepi32_ps(acc_u));
-        __m512 vg_tmp = _mm512_sub_ps(_mm512_setzero_ps(), vg);
-        __m512 exp_neg_vg = exp512_approx_ps(vg_tmp);
-        __m512 vu_tmp = _mm512_add_ps(_mm512_set1_ps(1.0f), vu);
-        __m512 silu = _mm512_div_ps(vg, vu_tmp);
+        __m512 neg_vg = _mm512_sub_ps(_mm512_setzero_ps(), vg);
+        __m512 exp_neg_vg = exp512_approx_ps(neg_vg);
+        __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_vg);
+        __m512 silu = _mm512_div_ps(vg, denom);
         __m512 h_vec = _mm512_mul_ps(silu, vu);
         h_amax_vec = _mm512_max_ps(h_amax_vec, _mm512_abs_ps(h_vec));
         _mm512_storeu_ps(&h[f], h_vec);
@@ -223,21 +226,24 @@ static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
     float r_s_h = (h_amax > 0.0f) ? 127.0f / h_amax : 1.0f;
     int8_t hq[MAX_D_FF];
     for (int f = 0; f < d_ff; f+=16) {
-        __m512i h_vec = _mm512_loadu_epi32(&h[f]);
-        __m512i h_vec_scaled = _mm512_mul_epi32(h_vec, _mm512_set1_epi32(r_s_h));
-        __m128i v_i8 = _mm512_cvtsepi32_epi8(h_vec_scaled);
-        _mm_storeu_epi8(&hq[f], v_i8);
+        __m512 h_vec = _mm512_loadu_ps(&h[f]);
+        __m512 h_scaled = _mm512_mul_ps(h_vec, _mm512_set1_ps(r_s_h));
+        __m512i h_i32 = _mm512_cvt_roundps_epi32(h_scaled, _MM_FROUND_NINT);
+        __m128i v_i8 = _mm512_cvtsepi32_epi8(h_i32);
+        _mm_storeu_si128((__m128i*)&hq[f], v_i8);
     }
 
     // Down projection
-    for (int d = 0; d < d_model; d+=16) {
+    for (int d = 0; d < d_model; d += 16) {
         __m512i acc = _mm512_setzero_epi32();
-        for (int f = 0; f < d_ff; f+=16) {
-            __m512i w_down_vec = _mm512_loadu_epi32(&w_down[d * d_ff + f * 16]);
-            __m512i hq_vec = _mm512_loadu_epi32(&hq[f]);
-            acc = _mm512_add_epi32(acc, _mm512_mul_epi32(w_down_vec, hq_vec));
+        for (int f = 0; f < d_ff; ++f) {
+            __m128i wd = _mm_loadu_si128((const __m128i*)&w_down[d * d_ff + f * 16]);
+            __m512i wd_i32 = _mm512_cvtepi8_epi32(wd);
+            __m512i hq_i32 = _mm512_set1_epi32((int32_t)hq[f]);
+            acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(wd_i32, hq_i32));
         }
-        _mm512_storeu_epi32(&out[d], acc);
+        __m512 acc_f = _mm512_mul_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(s_h * s_down));
+        _mm512_storeu_ps(&out[d], acc_f);
     }
 }
 
@@ -248,7 +254,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int num_experts = w.num_experts;
     const int top_k = w.top_k;
 
-    for (int t = 0; t < num_tokens; t++) {
+    for (int t = 0; t < num_tokens; ++t) {
         const float* xt = x + (size_t)t * d_model;
         float* yt = y + (size_t)t * d_model;
 
@@ -267,7 +273,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         for (int e = 0; e < num_experts; e+=16) {
             // acc[e] = <w.router[e], xt>
             __m512 acc = _mm512_setzero_ps();
-            for (int d = 0; d < d_model; d++) {
+            for (int d = 0; d < d_model; ++d) {
                 __m512 w_router_vec = _mm512_loadu_ps(&w.w_router[e * d_model + d * 16]);
                 __m512 xt_vec = _mm512_set1_ps(xt[d]);
                 acc = _mm512_fmadd_ps(w_router_vec, xt_vec, acc);
@@ -296,9 +302,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         int topk_idx[MAX_TOP_K];
         bool used[MAX_NUM_EXPERTS] = {};
         float gate_sum = 0.0f;
-        for (int k = 0; k < top_k; k++) {
+        for (int k = 0; k < top_k; ++k) {
             int best = -1;
-            for (int e = 0; e < num_experts; e++) {
+            for (int e = 0; e < num_experts; ++e) {
                 if (used[e]) continue;
                 if (best < 0 || s[e] + w.bias[e] > s[best] + w.bias[best]) {
                     best = e;
@@ -378,7 +384,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             float o_e[MAX_TOP_K][MAX_D_MODEL];
             expert_ffn(w.sh_gate, w.sh_up, w.sh_down, w.sh_s_gate, w.sh_s_up,
                     w.sh_s_down, xq, s_x, o_s, d_model, d_ff);
-            for (int e = 0; e < MAX_TOP_K; e++) {
+            for (int e = 0; e < MAX_TOP_K; ++e) {
                             expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
                         w.w_up + (size_t)e * d_ff * d_model,
                         w.w_down + (size_t)e * d_model * d_ff, w.s_gate[e],
@@ -388,7 +394,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                 __m512 o_s_vec = _mm512_loadu_ps(&o_s[d]);
                 __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
                 __m512 yt_vec = _mm512_add_ps(xt_vec, o_s_vec);
-                for (int k = 0; k < top_k; k++) {
+                for (int k = 0; k < top_k; ++k) {
                     int e = topk_idx[k];
                     __m512 o_e_vec = _mm512_loadu_ps(&o_e[e][d]);
                     __m512 gate_vec = _mm512_set1_ps(s[e] / gate_sum);
@@ -406,7 +412,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                 __m512 yt_vec = _mm512_add_ps(xt_vec, o_vec);
                 _mm512_storeu_ps(&yt[d], yt_vec);
             }
-            for (int k = 0; k < top_k; k++) {
+            for (int k = 0; k < top_k; ++k) {
                 int e = topk_idx[k];
                 float gate = s[e] / gate_sum;
                 expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
