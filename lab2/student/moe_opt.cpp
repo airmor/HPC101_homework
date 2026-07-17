@@ -373,28 +373,55 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * 
         */
 
-        float o_s[MAX_D_MODEL];
-        float o_e[MAX_TOP_K][MAX_D_MODEL];
-        expert_ffn(w.sh_gate, w.sh_up, w.sh_down, w.sh_s_gate, w.sh_s_up,
-                   w.sh_s_down, xq, s_x, o_s, d_model, d_ff);
-        for (int e = 0; e < MAX_TOP_K; e++) {
-                        expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
-                       w.w_up + (size_t)e * d_ff * d_model,
-                       w.w_down + (size_t)e * d_model * d_ff, w.s_gate[e],
-                       w.s_up[e], w.s_down[e], xq, s_x, o_e[e], d_model, d_ff);
-        }
-        for (int d = 0; d < d_model; d+=16) {
-            __m512 o_s_vec = _mm512_loadu_ps(&o_s[d]);
-            __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
-            __m512 yt_vec = _mm512_add_ps(xt_vec, o_s_vec);
+        #if 0
+            float o_s[MAX_D_MODEL];
+            float o_e[MAX_TOP_K][MAX_D_MODEL];
+            expert_ffn(w.sh_gate, w.sh_up, w.sh_down, w.sh_s_gate, w.sh_s_up,
+                    w.sh_s_down, xq, s_x, o_s, d_model, d_ff);
+            for (int e = 0; e < MAX_TOP_K; e++) {
+                            expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
+                        w.w_up + (size_t)e * d_ff * d_model,
+                        w.w_down + (size_t)e * d_model * d_ff, w.s_gate[e],
+                        w.s_up[e], w.s_down[e], xq, s_x, o_e[e], d_model, d_ff);
+            }
+            for (int d = 0; d < d_model; d+=16) {
+                __m512 o_s_vec = _mm512_loadu_ps(&o_s[d]);
+                __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
+                __m512 yt_vec = _mm512_add_ps(xt_vec, o_s_vec);
+                for (int k = 0; k < top_k; k++) {
+                    int e = topk_idx[k];
+                    __m512 o_e_vec = _mm512_loadu_ps(&o_e[e][d]);
+                    __m512 gate_vec = _mm512_set1_ps(s[e] / gate_sum);
+                    __m512 yt_vec = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_e_vec));
+                }
+                _mm512_storeu_ps(&yt[d], yt_vec);
+            }
+        #else
+            float o[MAX_D_MODEL];
+            expert_ffn(w.sh_gate, w.sh_up, w.sh_down, w.sh_s_gate, w.sh_s_up,
+                    w.sh_s_down, xq, s_x, o, d_model, d_ff);
+            for (int d = 0; d < d_model; d+=16) {
+                __m512 o_vec = _mm512_loadu_ps(&o[d]);
+                __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
+                __m512 yt_vec = _mm512_add_ps(xt_vec, o_vec);
+                _mm512_storeu_ps(&yt[d], yt_vec);
+            }
             for (int k = 0; k < top_k; k++) {
                 int e = topk_idx[k];
-                __m512 o_e_vec = _mm512_loadu_ps(&o_e[e][d]);
-                __m512 gate_vec = _mm512_set1_ps(s[e] / gate_sum);
-                __m512 yt_vec = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_e_vec));
+                float gate = s[e] / gate_sum;
+                expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
+                        w.w_up + (size_t)e * d_ff * d_model,
+                        w.w_down + (size_t)e * d_model * d_ff, w.s_gate[e],
+                        w.s_up[e], w.s_down[e], xq, s_x, o, d_model, d_ff);
+                for (int d = 0; d < d_model; d+=16) {
+                    __m512 o_vec = _mm512_loadu_ps(&o[d]);
+                    __m512 yt_vec = _mm512_loadu_ps(&yt[d]);
+                    __m512 gate_vec = _mm512_set1_ps(gate);
+                    __m512 yt_vec_updated = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_vec));
+                    _mm512_storeu_ps(&yt[d], yt_vec_updated);
+                }
             }
-            _mm512_storeu_ps(&yt[d], yt_vec);
-        }
+        #endif
         // ffn
         /*
         * ffn:
