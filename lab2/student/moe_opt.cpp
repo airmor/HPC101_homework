@@ -1,16 +1,8 @@
 // Main task: optimize the MoE forward pass.
 
 #include "moe.h"
-#include <algorithm>   // std::max：求最大值、最大误差
-#include <chrono>      // std::chrono：计时
-#include <cmath>       // std::sqrt / std::exp / std::abs
-#include <cstdint>     // 固定宽度整数类型；当前文件保留但基本未用
-#include <cstdlib>     // std::atoi：解析命令行参数
-#include <iostream>    // std::cout：打印结果
-#include <limits>      // std::numeric_limits：拿到 float 的无穷大
-#include <random>      // 随机数生成器
-#include <vector>      // std::vector：动态数组
-#include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_* 等
+#include <cstdint>     // int8_t
+#include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_*
 
 void preprocess(MoEWeights& w) {
     //change w.router to w.router_transpose
