@@ -28,6 +28,108 @@ void preprocess(MoEWeights& w) {
     }
     free(w.w_router); // free the original w.router
     w.w_router = w_router_transpose;
+
+    //change w.sh_gate to w.sh_gate_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_sh_gate_transpose = new int8_t[w.d_ff * w.d_model];
+    for (int f = 0; f < w.d_ff; f+=16) {
+        for (int d = 0; d < w.d_model; d++) {
+            for (int i = 0; i < 16; i++) {
+                w_sh_gate_transpose[f * w.d_model + d * 16 + i] = w.sh_gate[f * w.d_model + i * w.d_model + d];
+            }
+        }
+    }
+    free(w.sh_gate); // free the original w.sh_gate
+    w.sh_gate = w_sh_gate_transpose;
+
+    //change w.sh_up to w.sh_up_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_sh_up_transpose = new int8_t[w.d_ff * w.d_model];
+    for (int f = 0; f < w.d_ff; f+=16) {
+        for (int d = 0; d < w.d_model; d++) {
+            for (int i = 0; i < 16; i++) {
+                w_sh_up_transpose[f * w.d_model + d * 16 + i] = w.sh_up[f * w.d_model + i * w.d_model + d];
+            }
+        }
+    }
+    free(w.sh_up); // free the original w.sh_up
+    w.sh_up = w_sh_up_transpose;
+
+    //change w.sh_down to w.sh_down_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_sh_down_transpose = new int8_t[w.d_model * w.d_ff];
+    for (int d = 0; d < w.d_model; d+=16) {
+        for (int f = 0; f < w.d_ff; f++) {
+            for (int i = 0; i < 16; i++) {
+                w_sh_down_transpose[d * w.d_ff + f * 16 + i] = w.sh_down[d * w.d_ff + i * w.d_ff + f];
+            }
+        }
+    }
+    free(w.sh_down); // free the original w.sh_down
+    w.sh_down = w_sh_down_transpose;
+
+    //change w.w_gate to w.w_gate_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_gate_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
+    for (int e = 0; e < w.num_experts; e++) {
+        for (int f = 0; f < w.d_ff; f+=16) {
+            for (int d = 0; d < w.d_model; d++) {
+                for (int i = 0; i < 16; i++) {
+                    w_gate_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_gate[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
+                }
+            }
+        }
+    }
+    free(w.w_gate); // free the original w.w_gate
+    w.w_gate = w_gate_transpose;
+
+    //change w.w_up to w.w_up_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_up_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
+    for (int e = 0; e < w.num_experts; e++) {
+        for (int f = 0; f < w.d_ff; f+=16) {
+            for (int d = 0; d < w.d_model; d++) {
+                for (int i = 0; i < 16; i++) {
+                    w_up_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_up[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
+                }
+            }
+        }
+    }
+    free(w.w_up); // free the original w.w_up
+    w.w_up = w_up_transpose;
+
+    //change w.w_down to w.w_down_transpose
+    // | --/ | -> | |// |
+    // | /-/ | -> | ||| |
+    // | /-- | -> | //| |
+
+    int8_t* w_down_transpose = new int8_t[(size_t)w.num_experts * w.d_model * w.d_ff];
+    for (int e = 0; e < w.num_experts; e++) {
+        for (int d = 0; d < w.d_model; d+=16) {
+            for (int f = 0; f < w.d_ff; f++) {
+                for (int i = 0; i < 16; i++) {
+                    w_down_transpose[(size_t)e * w.d_model * w.d_ff + (size_t)d * w.d_ff + f * 16 + i] = w.w_down[(size_t)e * w.d_model * w.d_ff + (size_t)(d + i) * w.d_ff + f];
+                }
+            }
+        }
+    }
+    free(w.w_down); // free the original w.w_down
+    w.w_down = w_down_transpose;
 }
 
 
@@ -84,6 +186,61 @@ auto exp512_approx_ps = [](__m512 x) -> __m512
     return _mm512_mul_ps(p, pow2n);
 };
 
+static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
+                       const int8_t* w_down, float s_gate, float s_up,
+                       float s_down, const int8_t* xq, float s_x, float* out,
+                       int d_model, int d_ff) {
+    // Gate / up projections + SwiGLU activation
+    float h[MAX_D_FF];
+    float h_amax = 0.0f;
+    __m512 h_amax_vec = _mm512_setzero_ps();
+    for (int f = 0; f < d_ff; f+=16) {
+        __m512i acc_g = _mm512_setzero_epi32();
+        __m512i acc_u = _mm512_setzero_epi32();
+        for (int d = 0; d < d_model; ++d) {
+            __m512i w_gate_vec = _mm512_loadu_epi32(&w_gate[f * d_model + d * 16]);
+            __m512i w_up_vec = _mm512_loadu_epi32(&w_up[f * d_model + d * 16]);
+            __m512i xq_vec = _mm512_set1_epi32(xq[d]);
+            acc_g = _mm512_add_epi32(acc_g, _mm512_mul_epi32(w_gate_vec, xq_vec));
+            acc_u = _mm512_add_epi32(acc_u, _mm512_mul_epi32(w_up_vec, xq_vec));
+        }
+        __m512 s_x_mul_gate = _mm512_set1_ps(s_x * s_gate);
+        __m512 s_x_mul_up = _mm512_set1_ps(s_x * s_up);
+        __m512 vg = _mm512_mul_ps(s_x_mul_gate, _mm512_cvtepi32_ps(acc_g));
+        __m512 vu = _mm512_mul_ps(s_x_mul_up, _mm512_cvtepi32_ps(acc_u));
+        __m512 vg_tmp = _mm512_sub_ps(_mm512_setzero_ps(), vg);
+        __m512 exp_neg_vg = exp512_approx_ps(vg_tmp);
+        __m512 vu_tmp = _mm512_add_ps(_mm512_set1_ps(1.0f), vu);
+        __m512 silu = _mm512_div_ps(vg, vu_tmp);
+        __m512 h_vec = _mm512_mul_ps(silu, vu);
+        h_amax_vec = _mm512_max_ps(h_amax_vec, _mm512_abs_ps(h_vec));
+        _mm512_storeu_ps(&h[f], h_vec);
+    }
+    h_amax = _mm512_reduce_max_ps(h_amax_vec);
+
+    // Requantize hidden activation to int8
+    float s_h = (h_amax > 0.0f) ? h_amax / 127.0f : 1.0f;
+    float r_s_h = (h_amax > 0.0f) ? 127.0f / h_amax : 1.0f;
+    int8_t hq[MAX_D_FF];
+    for (int f = 0; f < d_ff; f+=16) {
+        __m512i h_vec = _mm512_loadu_epi32(&h[f]);
+        __m512i h_vec_scaled = _mm512_mul_epi32(h_vec, _mm512_set1_epi32(r_s_h));
+        __m128i v_i8 = _mm512_cvtsepi32_epi8(h_vec_scaled);
+        _mm_storeu_epi8(&hq[f], v_i8);
+    }
+
+    // Down projection
+    for (int d = 0; d < d_model; d+=16) {
+        __m512i acc = _mm512_setzero_epi32();
+        for (int f = 0; f < d_ff; f+=16) {
+            __m512i w_down_vec = _mm512_loadu_epi32(&w_down[d * d_ff + f * 16]);
+            __m512i hq_vec = _mm512_loadu_epi32(&hq[f]);
+            acc = _mm512_add_epi32(acc, _mm512_mul_epi32(w_down_vec, hq_vec));
+        }
+        _mm512_storeu_epi32(&out[d], acc);
+    }
+}
+
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
     const int d_model = w.d_model;
@@ -106,6 +263,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         */
         
         float s[MAX_NUM_EXPERTS];
+        //float s_add_bias[MAX_NUM_EXPERTS];
         for (int e = 0; e < num_experts; e+=16) {
             // acc[e] = <w.router[e], xt>
             __m512 acc = _mm512_setzero_ps();
@@ -121,15 +279,35 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_acc);
             __m512 s_vec = _mm512_div_ps(_mm512_set1_ps(1.0f), denom);
             _mm512_storeu_ps(&s[e], s_vec);
+            // s_add_bias[e] = w.bias[e] + s[e]
+            /*
+            __m512 bias_vec = _mm512_loadu_ps(&w.bias[e]);
+            __m512 s_add_bias_vec = _mm512_add_ps(bias_vec, s_vec);
+            _mm512_storeu_ps(&s_add_bias[e], s_add_bias_vec);
+            */
         }
 
-
-        // 2. Top-K selection by biased score (ties broken by smaller index)
+        // 2. Top-K selection by biased score (ties broken by smaller index) 
         /*
         * w.bias[e] + s[e] -> topk_idx[k]
+        * num_of_divide = sqrt(num_experts) is most efficient
         */
         
-
+        int topk_idx[MAX_TOP_K];
+        bool used[MAX_NUM_EXPERTS] = {};
+        float gate_sum = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            int best = -1;
+            for (int e = 0; e < num_experts; e++) {
+                if (used[e]) continue;
+                if (best < 0 || s[e] + w.bias[e] > s[best] + w.bias[best]) {
+                    best = e;
+                }
+            }
+            used[best] = true;
+            topk_idx[k] = best;
+            gate_sum += s[best];
+        }
 
         // 3. Gate values: normalize the ORIGINAL affinities of the selected
         //    experts (the bias never enters the gate values)
@@ -137,6 +315,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * g[e] = s[e] / sum_{k=0}^{top_k-1} s[topk_idx[k]]
         * may combine with step 2
         */
+
         // 4. Quantize the token to int8 (symmetric, per-token scale)
         /*
         * Convert the token to int8 using a symmetric quantization scheme
@@ -149,6 +328,33 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * r_s_x = 1.0f / s_x
         * xq[d] = (int8_t)lrintf(xt[d] * r_s_x)
         */
+
+        // x_amax = max(|xt[t]|)
+        float x_amax = 0.0f;
+        __m512 xt_vec_max = _mm512_setzero_ps();
+        for (int d = 0; d < d_model; d+=16) {
+            __m512 xt_vec_now = _mm512_loadu_ps(&xt[d]);
+            xt_vec_max = _mm512_max_ps(xt_vec_max, _mm512_abs_ps(xt_vec_now));
+        }
+        // reduce max
+        x_amax = _mm512_reduce_max_ps(xt_vec_max);
+
+        // s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f
+        float s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f;
+
+        // change to r_s_x = 1.0f / s_x
+        float r_s_x = (x_amax > 0.0f) ? 127.0f / x_amax : 1.0f;
+
+        // xq[d] = (int8_t)lrintf(xt[d] * r_s_x)
+        int8_t xq[MAX_D_MODEL];
+        for (int d = 0; d < d_model; d+=16) {
+            __m512 xt_vec_now = _mm512_loadu_ps(&xt[d]);
+            __m512 xt_vec_now_scaled = _mm512_mul_ps(xt_vec_now, _mm512_set1_ps(r_s_x));
+            __m512i v_i32 = _mm512_cvt_roundps_epi32(xt_vec_now_scaled, _MM_FROUND_NINT);
+            __m128i v_i8 = _mm512_cvtsepi32_epi8(v_i32);
+            _mm_storeu_si128((__m128i*)(void*)&xq[d], v_i8);
+        }
+
         // 5+6. Shared expert (always on), then selected routed experts,
         //      combined on top of the residual connection
         /*
@@ -166,6 +372,29 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * yt += sum(g_e * o_e) for e in topk_idx
         * 
         */
+
+        float o_s[MAX_D_MODEL];
+        float o_e[MAX_TOP_K][MAX_D_MODEL];
+        expert_ffn(w.sh_gate, w.sh_up, w.sh_down, w.sh_s_gate, w.sh_s_up,
+                   w.sh_s_down, xq, s_x, o_s, d_model, d_ff);
+        for (int e = 0; e < MAX_TOP_K; e++) {
+                        expert_ffn(w.w_gate + (size_t)e * d_ff * d_model,
+                       w.w_up + (size_t)e * d_ff * d_model,
+                       w.w_down + (size_t)e * d_model * d_ff, w.s_gate[e],
+                       w.s_up[e], w.s_down[e], xq, s_x, o_e[e], d_model, d_ff);
+        }
+        for (int d = 0; d < d_model; d+=16) {
+            __m512 o_s_vec = _mm512_loadu_ps(&o_s[d]);
+            __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
+            __m512 yt_vec = _mm512_add_ps(xt_vec, o_s_vec);
+            for (int k = 0; k < top_k; k++) {
+                int e = topk_idx[k];
+                __m512 o_e_vec = _mm512_loadu_ps(&o_e[e][d]);
+                __m512 gate_vec = _mm512_set1_ps(s[e] / gate_sum);
+                __m512 yt_vec = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_e_vec));
+            }
+            _mm512_storeu_ps(&yt[d], yt_vec);
+        }
         // ffn
         /*
         * ffn:
