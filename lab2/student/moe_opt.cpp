@@ -220,7 +220,7 @@ static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
     for (int f = 0; f < d_ff; f+=16) {
         __m512 h_vec = _mm512_loadu_ps(&h[f]);
         __m512 h_scaled = _mm512_mul_ps(h_vec, _mm512_set1_ps(r_s_h));
-        __m512i h_i32 = _mm512_cvt_roundps_epi32(h_scaled, _MM_FROUND_NINT);
+        __m512i h_i32 = _mm512_cvt_roundps_epi32(h_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         __m128i v_i8 = _mm512_cvtsepi32_epi8(h_i32);
         _mm_storeu_si128((__m128i*)&hq[f], v_i8);
     }
@@ -349,7 +349,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         for (int d = 0; d < d_model; d+=16) {
             __m512 xt_vec_now = _mm512_loadu_ps(&xt[d]);
             __m512 xt_vec_now_scaled = _mm512_mul_ps(xt_vec_now, _mm512_set1_ps(r_s_x));
-            __m512i v_i32 = _mm512_cvt_roundps_epi32(xt_vec_now_scaled, _MM_FROUND_NINT);
+            __m512i v_i32 = _mm512_cvt_roundps_epi32(xt_vec_now_scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             __m128i v_i8 = _mm512_cvtsepi32_epi8(v_i32);
             _mm_storeu_si128((__m128i*)(void*)&xq[d], v_i8);
         }
