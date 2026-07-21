@@ -175,10 +175,14 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
     
 
     int32_t x_sum = 0;
-    for (int d = 0; d < d_model; ++d) {
-        x_sum += xq[d];
+    __m512i x_sum_vec = _mm512_setzero_si512();
+    for (int d = 0; d < d_model; d += 16) {
+        __m128i xq_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(xq + d));
+        __m512i xq_i32 = _mm512_cvtepi8_epi32(xq_128);
+        x_sum_vec = _mm512_add_epi32(x_sum_vec, xq_i32);
     }
-    
+    x_sum = _mm512_reduce_add_epi32(x_sum_vec);
+
     const __m512i correction = _mm512_set1_epi32(-128 * x_sum);
     __m512 h_amax_vec = _mm512_setzero_ps();
     for (int f = 0; f < d_ff; f+=16) {
@@ -235,8 +239,14 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
     }
 
     int32_t hq_sum = 0;
-    for (int f = 0; f < d_ff; ++f) {
-        hq_sum += hq[f];
+    {
+        __m512i hq_sum_vec = _mm512_setzero_si512();
+        for (int f = 0; f < d_ff; f += 16) {
+            __m128i hq_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hq + f));
+            __m512i hq_i32 = _mm512_cvtepi8_epi32(hq_128);
+            hq_sum_vec = _mm512_add_epi32(hq_sum_vec, hq_i32);
+        }
+        hq_sum = _mm512_reduce_add_epi32(hq_sum_vec);
     }
 
     const __m512 s_x_mul_down = _mm512_set1_ps(s_h * s_down);
