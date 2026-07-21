@@ -2,15 +2,49 @@
 
 #include "moe.h"
 #include <cstdint>     // int8_t
+#include <cstring>
+#include <smmintrin.h>
+#include <emmintrin.h>
 #include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_*
+#include <cassert>
+#define IS_AMX 0
 
 float* w_router_transpose;
-int8_t* w_sh_gate_transpose;
-int8_t* w_sh_up_transpose;
-int8_t* w_sh_down_transpose;
-int8_t* w_gate_transpose;
-int8_t* w_up_transpose;
-int8_t* w_down_transpose;
+uint8_t* w_sh_gate_transpose;
+uint8_t* w_sh_up_transpose;
+uint8_t* w_sh_down_transpose;
+uint8_t* w_gate_transpose;
+uint8_t* w_up_transpose;
+uint8_t* w_down_transpose;
+
+struct alignas(64) amx_tilecfg {
+    uint8_t  palette_id;
+    uint8_t  start_row;
+    uint8_t  reserved[14];
+    uint16_t colsb[16];
+    uint8_t  rows[16];
+};
+static inline void load_amx_gemv_config()
+{
+    amx_tilecfg cfg{};
+    cfg.palette_id = 1;
+    // tmm0: gate/down accumulator, 1 x 16 int32
+    cfg.rows[0]  = 1;
+    cfg.colsb[0] = 16 * sizeof(int32_t);   // 64 bytes
+    // tmm1: up accumulator, 1 x 16 int32
+    cfg.rows[1]  = 1;
+    cfg.colsb[1] = 16 * sizeof(int32_t);   // 64 bytes
+    // tmm2: activation, 1 x 64 int8
+    cfg.rows[2]  = 1;
+    cfg.colsb[2] = 64;
+    // tmm3: gate/down weights, packed 16 x 64 bytes
+    cfg.rows[3]  = 16;
+    cfg.colsb[3] = 64;
+    // tmm4: up weights, packed 16 x 64 bytes
+    cfg.rows[4]  = 16;
+    cfg.colsb[4] = 64;
+    _tile_loadconfig(&cfg);
+}
 
 void preprocess(MoEWeights& w) {
     //change w.router to w.router_transpose
@@ -18,6 +52,7 @@ void preprocess(MoEWeights& w) {
     // | /-/ | -> | ||| |
     // | /-- | -> | //| |
 
+    assert(w.num_experts % 16 == 0);
     w_router_transpose = new float[w.num_experts * w.d_model];
     for (int e = 0; e < w.num_experts; e+=16) {
         for (int d = 0; d < w.d_model; ++d) {
@@ -29,107 +64,42 @@ void preprocess(MoEWeights& w) {
     //delete[] w.w_router; // free the original w.router
     //w.w_router = w_router_transpose;
 
-    //change w.sh_gate to w.sh_gate_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
-
-    w_sh_gate_transpose = new int8_t[w.d_ff * w.d_model];
-    for (int f = 0; f < w.d_ff; f+=16) {
-        for (int d = 0; d < w.d_model; ++d) {
-            for (int i = 0; i < 16; ++i) {
-                w_sh_gate_transpose[f * w.d_model + d * 16 + i] = w.sh_gate[f * w.d_model + i * w.d_model + d];
-            }
-        }
-    }
-    //delete[] w.sh_gate; // free the original w.sh_gate
-    //w.sh_gate = w_sh_gate_transpose;
-
-    //change w.sh_up to w.sh_up_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
-
-    w_sh_up_transpose = new int8_t[w.d_ff * w.d_model];
-    for (int f = 0; f < w.d_ff; f+=16) {
-        for (int d = 0; d < w.d_model; ++d) {
-            for (int i = 0; i < 16; ++i) {
-                w_sh_up_transpose[f * w.d_model + d * 16 + i] = w.sh_up[f * w.d_model + i * w.d_model + d];
-            }
-        }
-    }
-    //delete[] w.sh_up; // free the original w.sh_up
-    //w.sh_up = w_sh_up_transpose;
-
-    //change w.sh_down to w.sh_down_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
-
-    w_sh_down_transpose = new int8_t[w.d_model * w.d_ff];
-    for (int d = 0; d < w.d_model; d+=16) {
-        for (int f = 0; f < w.d_ff; ++f) {
-            for (int i = 0; i < 16; ++i) {
-                w_sh_down_transpose[d * w.d_ff + f * 16 + i] = w.sh_down[d * w.d_ff + i * w.d_ff + f];
-            }
-        }
-    }
-    //delete[] w.sh_down; // free the original w.sh_down
-    //w.sh_down = w_sh_down_transpose;
-
-    //change w.w_gate to w.w_gate_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
-
-    w_gate_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
-    for (int e = 0; e < w.num_experts; ++e) {
-        for (int f = 0; f < w.d_ff; f+=16) {
-            for (int d = 0; d < w.d_model; ++d) {
+    // VNNI weight packing: repack int8 [rows][cols] weights into the layout
+    auto pack_vnni = [](const int8_t* src, uint8_t* dst, int rows, int cols) {
+        for (int r = 0; r < rows; r += 16) {
+            for (int c = 0; c < cols; c += 4) {
                 for (int i = 0; i < 16; ++i) {
-                    w_gate_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_gate[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
+                    for (int j = 0; j < 4; ++j) {
+                        dst[r * cols + c * 16 + i * 4 + j] =
+                            static_cast<uint8_t>(static_cast<int>(src[(r + i) * cols + (c + j)]) + 128);
+                    }
                 }
             }
         }
-    }
-    //delete[] w.w_gate; // free the original w.w_gate
-    //w.w_gate = w_gate_transpose;
+    };
 
-    //change w.w_up to w.w_up_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
+    // Shared expert (same shape as one routed expert)
+    w_sh_gate_transpose = new uint8_t[(size_t)w.d_ff * w.d_model];
+    pack_vnni(w.sh_gate, w_sh_gate_transpose, w.d_ff, w.d_model);
+    w_sh_up_transpose   = new uint8_t[(size_t)w.d_ff * w.d_model];
+    pack_vnni(w.sh_up,   w_sh_up_transpose,   w.d_ff, w.d_model);
+    w_sh_down_transpose = new uint8_t[(size_t)w.d_model * w.d_ff];
+    pack_vnni(w.sh_down, w_sh_down_transpose, w.d_model, w.d_ff);
 
-    w_up_transpose = new int8_t[(size_t)w.num_experts * w.d_ff * w.d_model];
+    // Routed experts: [num_experts][...]
+    const size_t gate_up_size = (size_t)w.d_ff * w.d_model;
+    const size_t down_size    = (size_t)w.d_model * w.d_ff;
+    w_gate_transpose = new uint8_t[(size_t)w.num_experts * gate_up_size];
+    w_up_transpose   = new uint8_t[(size_t)w.num_experts * gate_up_size];
+    w_down_transpose = new uint8_t[(size_t)w.num_experts * down_size];
     for (int e = 0; e < w.num_experts; ++e) {
-        for (int f = 0; f < w.d_ff; f+=16) {
-            for (int d = 0; d < w.d_model; ++d) {
-                for (int i = 0; i < 16; ++i) {
-                    w_up_transpose[(size_t)e * w.d_ff * w.d_model + (size_t)f * w.d_model + d * 16 + i] = w.w_up[(size_t)e * w.d_ff * w.d_model + (size_t)(f + i) * w.d_model + d];
-                }
-            }
-        }
+        pack_vnni(w.w_gate + e * gate_up_size,
+                  w_gate_transpose + (size_t)e * gate_up_size, w.d_ff, w.d_model);
+        pack_vnni(w.w_up   + e * gate_up_size,
+                  w_up_transpose   + (size_t)e * gate_up_size, w.d_ff, w.d_model);
+        pack_vnni(w.w_down + e * down_size,
+                  w_down_transpose + (size_t)e * down_size, w.d_model, w.d_ff);
     }
-    //delete[] w.w_up; // free the original w.w_up
-    //w.w_up = w_up_transpose;
-
-    //change w.w_down to w.w_down_transpose
-    // | --/ | -> | |// |
-    // | /-/ | -> | ||| |
-    // | /-- | -> | //| |
-
-    w_down_transpose = new int8_t[(size_t)w.num_experts * w.d_model * w.d_ff];
-    for (int e = 0; e < w.num_experts; ++e) {
-        for (int d = 0; d < w.d_model; d+=16) {
-            for (int f = 0; f < w.d_ff; ++f) {
-                for (int i = 0; i < 16; ++i) {
-                    w_down_transpose[(size_t)e * w.d_model * w.d_ff + (size_t)d * w.d_ff + f * 16 + i] = w.w_down[(size_t)e * w.d_model * w.d_ff + (size_t)(d + i) * w.d_ff + f];
-                }
-            }
-        }
-    }
-    //delete[] w.w_down; // free the original w.w_down
-    //w.w_down = w_down_transpose;
 }
 
 
@@ -186,38 +156,68 @@ auto exp512_approx_ps = [](__m512 x) -> __m512
     return _mm512_mul_ps(p, pow2n);
 };
 
-static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
-                       const int8_t* w_down, float s_gate, float s_up,
+static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
+                       const uint8_t* w_down, float s_gate, float s_up,
                        float s_down, const int8_t* xq, float s_x, float* out,
                        int d_model, int d_ff) {
+
+    assert(d_model % 16 == 0);
+    assert(d_ff % 16 == 0);
+    assert(d_ff <= MAX_D_FF);
+
     // Gate / up projections + SwiGLU activation
     float h[MAX_D_FF];
     float h_amax = 0.0f;
+
+    const __m512 s_x_mul_gate = _mm512_set1_ps(s_x * s_gate);
+    const __m512 s_x_mul_up = _mm512_set1_ps(s_x * s_up);
+    
+
+    int32_t x_sum = 0;
+    for (int d = 0; d < d_model; ++d) {
+        x_sum += xq[d];
+    }
+    
+    const __m512i correction = _mm512_set1_epi32(-128 * x_sum);
     __m512 h_amax_vec = _mm512_setzero_ps();
     for (int f = 0; f < d_ff; f+=16) {
-        __m512i acc_g = _mm512_setzero_epi32();
-        __m512i acc_u = _mm512_setzero_epi32();
-        for (int d = 0; d < d_model; ++d) {
-            // Load 16 int8 weights, sign-extend to int32
-            __m128i w_gate_16 = _mm_loadu_si128((const __m128i*)&w_gate[f * d_model + d * 16]);
-            __m128i w_up_16   = _mm_loadu_si128((const __m128i*)&w_up  [f * d_model + d * 16]);
-            __m512i w_gate_i32 = _mm512_cvtepi8_epi32(w_gate_16);
-            __m512i w_up_i32   = _mm512_cvtepi8_epi32(w_up_16);
-            __m512i xq_i32 = _mm512_set1_epi32((int32_t)xq[d]);
-            acc_g = _mm512_add_epi32(acc_g, _mm512_mullo_epi32(w_gate_i32, xq_i32));
-            acc_u = _mm512_add_epi32(acc_u, _mm512_mullo_epi32(w_up_i32,   xq_i32));
+        
+        __m512i gate_acc = correction;
+        __m512i up_acc = correction;
+        const size_t f_offset = static_cast<size_t>(f) * d_model;
+
+        for (int k = 0; k < d_model; k += 4) { // one time x4
+
+            //read xq
+            uint32_t x4;
+            memcpy(&x4, xq + k, sizeof(x4));
+
+            const __m512i x4_i32 = _mm512_set1_epi32(static_cast<int32_t>(x4));
+            const size_t k4_offset = static_cast<size_t>(k / 4) * 64;
+
+            // read w_gate
+            const __m512i w_gate_vec_16x4 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(f_offset + k4_offset + w_gate));
+
+            // read w_up
+            const __m512i w_up_vec_16x4 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(f_offset + k4_offset + w_up));
+
+            // calculate
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, w_gate_vec_16x4, x4_i32);
+            up_acc = _mm512_dpbusd_epi32(up_acc, w_up_vec_16x4, x4_i32);
+
+
         }
-        __m512 s_x_mul_gate = _mm512_set1_ps(s_x * s_gate);
-        __m512 s_x_mul_up = _mm512_set1_ps(s_x * s_up);
-        __m512 vg = _mm512_mul_ps(s_x_mul_gate, _mm512_cvtepi32_ps(acc_g));
-        __m512 vu = _mm512_mul_ps(s_x_mul_up, _mm512_cvtepi32_ps(acc_u));
+
+        __m512 vg = _mm512_mul_ps(s_x_mul_gate, _mm512_cvtepi32_ps(gate_acc));
+        __m512 vu = _mm512_mul_ps(s_x_mul_up, _mm512_cvtepi32_ps(up_acc));
         __m512 neg_vg = _mm512_sub_ps(_mm512_setzero_ps(), vg);
         __m512 exp_neg_vg = exp512_approx_ps(neg_vg);
         __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_vg);
         __m512 silu = _mm512_div_ps(vg, denom);
         __m512 h_vec = _mm512_mul_ps(silu, vu);
         h_amax_vec = _mm512_max_ps(h_amax_vec, _mm512_abs_ps(h_vec));
-        _mm512_storeu_ps(&h[f], h_vec);
+        _mm512_storeu_ps(&h[f], h_vec); // store h_vec to h[f] array
+        
     }
     h_amax = _mm512_reduce_max_ps(h_amax_vec);
 
@@ -233,16 +233,34 @@ static void expert_ffn(const int8_t* w_gate, const int8_t* w_up,
         _mm_storeu_si128((__m128i*)&hq[f], v_i8);
     }
 
+    int32_t hq_sum = 0;
+    for (int f = 0; f < d_ff; ++f) {
+        hq_sum += hq[f];
+    }
+
+    const __m512 s_x_mul_down = _mm512_set1_ps(s_h * s_down);
+
     // Down projection
     for (int d = 0; d < d_model; d += 16) {
-        __m512i acc = _mm512_setzero_epi32();
-        for (int f = 0; f < d_ff; ++f) {
-            __m128i wd = _mm_loadu_si128((const __m128i*)&w_down[d * d_ff + f * 16]);
-            __m512i wd_i32 = _mm512_cvtepi8_epi32(wd);
-            __m512i hq_i32 = _mm512_set1_epi32((int32_t)hq[f]);
-            acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(wd_i32, hq_i32));
+        __m512i acc = _mm512_set1_epi32(-128 * hq_sum);
+        const size_t d_offset = static_cast<size_t>(d) * d_ff;
+        for (int f = 0; f < d_ff; f+=4) { // one time x4
+
+            //read hq
+            uint32_t hq4;
+            memcpy(&hq4, hq + f, sizeof(hq4));
+
+            // convert hq4 to __m512i
+            const __m512i hq4_i32 = _mm512_set1_epi32(static_cast<int32_t>(hq4));
+            const size_t f4_offset = static_cast<size_t>(f / 4) * 64;
+
+            // read w_down
+            const __m512i w_down_vec_16x4 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(d_offset + f4_offset + w_down));
+
+            // calculate
+            acc = _mm512_dpbusd_epi32(acc, w_down_vec_16x4, hq4_i32);
         }
-        __m512 acc_f = _mm512_mul_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(s_h * s_down));
+        __m512 acc_f = _mm512_mul_ps(_mm512_cvtepi32_ps(acc), s_x_mul_down);
         _mm512_storeu_ps(&out[d], acc_f);
     }
 }
@@ -380,28 +398,22 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * 
         */
 
-        #if 0
-            float o_s[MAX_D_MODEL];
-            float o_e[MAX_TOP_K][MAX_D_MODEL];
-            expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose, w.sh_s_gate, w.sh_s_up,
-                    w.sh_s_down, xq, s_x, o_s, d_model, d_ff);
-            for (int e = 0; e < MAX_TOP_K; ++e) {
-                            expert_ffn(w_gate_transpose + (size_t)e * d_ff * d_model,
+        #if IS_AMX
+            float o[MAX_D_MODEL];
+            for (int k = 0; k < top_k; ++k) {
+                int e = topk_idx[k];
+                float gate = s[e] / gate_sum;
+                expert_ffn(w_gate_transpose + (size_t)e * d_ff * d_model,
                         w_up_transpose + (size_t)e * d_ff * d_model,
                         w_down_transpose + (size_t)e * d_model * d_ff, w.s_gate[e],
-                        w.s_up[e], w.s_down[e], xq, s_x, o_e[e], d_model, d_ff);
-            }
-            for (int d = 0; d < d_model; d+=16) {
-                __m512 o_s_vec = _mm512_loadu_ps(&o_s[d]);
-                __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
-                __m512 yt_vec = _mm512_add_ps(xt_vec, o_s_vec);
-                for (int k = 0; k < top_k; ++k) {
-                    int e = topk_idx[k];
-                    __m512 o_e_vec = _mm512_loadu_ps(&o_e[e][d]);
-                    __m512 gate_vec = _mm512_set1_ps(s[e] / gate_sum);
-                    __m512 yt_vec = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_e_vec));
+                        w.s_up[e], w.s_down[e], xq, s_x, o, d_model, d_ff);
+                for (int d = 0; d < d_model; d+=16) {
+                    __m512 o_vec = _mm512_loadu_ps(&o[d]);
+                    __m512 yt_vec = _mm512_loadu_ps(&yt[d]);
+                    __m512 gate_vec = _mm512_set1_ps(gate);
+                    __m512 yt_vec_updated = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_vec));
+                    _mm512_storeu_ps(&yt[d], yt_vec_updated);
                 }
-                _mm512_storeu_ps(&yt[d], yt_vec);
             }
         #else
             float o[MAX_D_MODEL];
