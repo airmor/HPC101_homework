@@ -7,6 +7,7 @@
 #include <emmintrin.h>
 #include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_*
 #include <cassert>
+#include <omp.h>
 #define IS_AMX 0
 
 float* w_router_transpose;
