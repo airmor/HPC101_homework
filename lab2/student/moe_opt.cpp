@@ -272,8 +272,12 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int d_ff = w.d_ff;
     const int num_experts = w.num_experts;
     const int top_k = w.top_k;
-    
-    #pragma omp parallel for collapse(2)
+
+    // set up OpenMP for parallel processing of tokens
+    omp_set_dynamic(0);
+    omp_set_num_threads(4);
+
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* xt = x + (size_t)t * d_model;
         float* yt = y + (size_t)t * d_model;
