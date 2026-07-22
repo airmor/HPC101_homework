@@ -309,7 +309,12 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     omp_set_dynamic(0);
     omp_set_num_threads(4);
 
-    int8_t xq_total[MAX_NUM_TOKENS][MAX_D_MODEL] = {0};
+    int8_t* xq_total = new int8_t[MAX_NUM_TOKENS * MAX_D_MODEL] {0};
+    int** topk_idx_total = new int*[MAX_NUM_TOKENS] {0};
+    float** s_total = new float*[MAX_NUM_TOKENS] {0};
+    float* gate_sum_total = new float[MAX_NUM_TOKENS] {0.0f};
+    float* s_x_total = new float[MAX_NUM_TOKENS] {0.0f};
+
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* xt = x + (size_t)t * d_model;
@@ -325,7 +330,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * | /-- |    | //| |
         */
         
-        float s[MAX_NUM_EXPERTS];
+        float* s = s_total[t] = new float[num_experts] {0.0f};//s_add_bias[MAX_NUM_EXPERTS] = new float[num_experts] {0.0f};//s_add_bias[MAX_NUM_EXPERTS] = new float[num_experts] {0.0f};//s_add_bias[MAX_NUM_EXPERTS] = new float[num_experts] {0.0f};//s_add_bias[MAX_NUM_EXPERTS] = new float[num_exp
         //float s_add_bias[MAX_NUM_EXPERTS];
         for (int e = 0; e < num_experts; e+=16) {
             // acc[e] = <w.router[e], xt>
@@ -356,9 +361,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * num_of_divide = sqrt(num_experts) is most efficient
         */
         
-        int topk_idx[MAX_TOP_K];
+        int* topk_idx = topk_idx_total[t] = new int[top_k] {0};
         bool used[MAX_NUM_EXPERTS] = {};
-        float gate_sum = 0.0f;
+        float &gate_sum = gate_sum_total[t];
         for (int k = 0; k < top_k; ++k) {
             int best = -1;
             for (int e = 0; e < num_experts; ++e) {
@@ -403,13 +408,13 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         x_amax = _mm512_reduce_max_ps(xt_vec_max);
 
         // s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f
-        float s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f;
+        float &s_x = s_x_total[t] = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f;
 
         // change to r_s_x = 1.0f / s_x
         float r_s_x = (x_amax > 0.0f) ? 127.0f / x_amax : 1.0f;
 
         // xq[d] = (int8_t)lrintf(xt[d] * r_s_x)
-        int8_t* xq = xq_total[t];
+        int8_t* xq = xq_total + (size_t)t * d_model;
         for (int d = 0; d < d_model; d+=16) {
             __m512 xt_vec_now = _mm512_loadu_ps(&xt[d]);
             __m512 xt_vec_now_scaled = _mm512_mul_ps(xt_vec_now, _mm512_set1_ps(r_s_x));
@@ -417,6 +422,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             __m128i v_i8 = _mm512_cvtsepi32_epi8(v_i32);
             _mm_storeu_si128((__m128i*)(void*)&xq[d], v_i8);
         }
+    }
 
         // 5+6. Shared expert (always on), then selected routed experts,
         //      combined on top of the residual connection
@@ -435,11 +441,26 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * yt += sum(g_e * o_e) for e in topk_idx
         * 
         */
+    // shared expert
+
+    #if IS_AMX
+
+    #endif
+    // route expert
+    for (int t = 0; t < num_tokens; ++t) {
+    
+        int* topk_idx = topk_idx_total[t];
+        int8_t* xq = xq_total + (size_t)t * d_model;
+        float* s = s_total[t];
+        const float* xt = x + (size_t)t * d_model;
+        float* yt = y + (size_t)t * d_model;
+        float &gate_sum = gate_sum_total[t];
+        float &s_x = s_x_total[t];
 
         #if IS_AMX
 
-
             float o[MAX_D_MODEL];
+
             for (int k = 0; k < top_k; ++k) {
                 int e = topk_idx[k];
                 float gate = s[e] / gate_sum;
@@ -481,14 +502,5 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                 }
             }
         #endif
-        // ffn
-        /*
-        * ffn:
-        *   - w_down
-        *   - w_up
-        *   - w_gate
-        * 
-        *
-        */
     }
 }
