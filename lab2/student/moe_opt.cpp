@@ -21,36 +21,194 @@ uint8_t* w_down_transpose;
 #if IS_AMX
 
 struct alignas(64) amx_tilecfg {
-    uint8_t  palette_id;
-    uint8_t  start_row;
-    uint8_t  reserved[14];
+    uint8_t palette_id;
+    uint8_t start_row;
+    uint8_t reserved[14];
     uint16_t colsb[16];
-    uint8_t  rows[16];
+    uint8_t rows[16];
 };
-static inline void load_amx_shared_config(int B)
-{
+
+static inline void load_amx_shared_config(int B) {
     assert(B >= 1 && B <= 16);
     amx_tilecfg cfg{};
     cfg.palette_id = 1;
-    // tmm0: gate/down accumulator
-    // 16 output channels × B int32
-    cfg.rows[0]  = 16;
-    cfg.colsb[0] = static_cast<uint16_t>(B * 4);
-    // tmm1: up accumulator
-    cfg.rows[1]  = 16;
-    cfg.colsb[1] = static_cast<uint16_t>(B * 4);
-    // tmm2: gate/down weights
-    // 16 output channels × 64 uint8
-    cfg.rows[2]  = 16;
-    cfg.colsb[2] = 64;
-    // tmm3: up weights
-    cfg.rows[3]  = 16;
-    cfg.colsb[3] = 64;
-    // tmm4: packed activations
-    // K/4 = 16 rows, each row contains B groups of 4 bytes
-    cfg.rows[4]  = 16;
+    cfg.rows[0] = cfg.rows[1] = 16;
+    cfg.colsb[0] = cfg.colsb[1] = static_cast<uint16_t>(B * 4);
+    cfg.rows[2] = cfg.rows[3] = 16;
+    cfg.colsb[2] = cfg.colsb[3] = 64;
+    cfg.rows[4] = 16;
     cfg.colsb[4] = static_cast<uint16_t>(B * 4);
     _tile_loadconfig(&cfg);
+}
+
+// AMX requires each tile to be laid out as [16 output rows][64 K bytes].
+// This differs from the AVX-512 VNNI packing used by routed experts below.
+static void pack_amx_shared_weights(const int8_t* src, uint8_t* dst,
+                                    int rows, int cols) {
+    assert(rows % 16 == 0);
+    assert(cols % 64 == 0);
+    for (int r = 0; r < rows; r += 16) {
+        for (int k0 = 0; k0 < cols; k0 += 64) {
+            uint8_t* tile = dst + static_cast<size_t>(r) * cols +
+                            static_cast<size_t>(k0) * 16;
+            for (int i = 0; i < 16; ++i) {
+                for (int k = 0; k < 64; ++k) {
+                    tile[i * 64 + k] = static_cast<uint8_t>(
+                        static_cast<int>(src[static_cast<size_t>(r + i) * cols + k0 + k]) + 128);
+                }
+            }
+        }
+    }
+}
+
+// Kept local to the AMX branch because the existing lambda with the same
+// approximation is declared later for the routed-expert AVX-512 path.
+static inline __m512 exp512_approx_ps_amx(__m512 x) {
+    x = _mm512_min_ps(x, _mm512_set1_ps(88.3762626647949f));
+    x = _mm512_max_ps(x, _mm512_set1_ps(-87.3365447505531f));
+    const __m512 y = _mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f));
+    const __m512i n = _mm512_cvt_roundps_epi32(
+        y, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    const __m512 nf = _mm512_cvtepi32_ps(n);
+    __m512 r = _mm512_fnmadd_ps(nf, _mm512_set1_ps(0.693359375f), x);
+    r = _mm512_fnmadd_ps(nf, _mm512_set1_ps(-2.12194440e-4f), r);
+    __m512 p = _mm512_set1_ps(1.0f / 720.0f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 120.0f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 24.0f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 6.0f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 2.0f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+    const __m512i pow2_bits = _mm512_slli_epi32(
+        _mm512_add_epi32(n, _mm512_set1_epi32(127)), 23);
+    return _mm512_mul_ps(p, _mm512_castsi512_ps(pow2_bits));
+}
+
+// Execute all three shared-expert projections for B contiguous tokens.
+// Activations use [K/4][B * 4] rows: every token lane occupies four bytes.
+static void shared_expert_amx_batch(const float* x, float* y,
+                                    const uint8_t* w_gate,
+                                    const uint8_t* w_up,
+                                    const uint8_t* w_down,
+                                    float s_gate, float s_up, float s_down,
+                                    const int8_t* xq_total,
+                                    const float* s_x_total,
+                                    int block_begin, int B,
+                                    int d_model, int d_ff) {
+    assert(B >= 1 && B <= 16);
+    assert(d_model % 64 == 0 && d_ff % 64 == 0);
+
+    alignas(64) int8_t x_tile[(MAX_D_MODEL / 4) * 16 * 4];
+    alignas(64) int8_t h_tile[(MAX_D_FF / 4) * 16 * 4];
+    alignas(64) float hidden[16 * MAX_D_FF];
+    alignas(64) int8_t hq[16 * MAX_D_FF];
+    alignas(64) int32_t gate_acc[16 * 16];
+    alignas(64) int32_t up_acc[16 * 16];
+    alignas(64) int32_t down_acc[16 * 16];
+    int32_t x_sum[16] = {};
+    int32_t hq_sum[16] = {};
+    float h_amax[16] = {};
+    float s_h[16] = {};
+
+    for (int b = 0; b < B; ++b) {
+        const int8_t* xq = xq_total + static_cast<size_t>(block_begin + b) * d_model;
+        for (int d = 0; d < d_model; ++d) x_sum[b] += xq[d];
+    }
+    for (int k0 = 0; k0 < d_model; k0 += 64) {
+        int8_t* dst_block = x_tile + static_cast<size_t>(k0 / 4) * B * 4;
+        for (int k4 = 0; k4 < 16; ++k4) {
+            int8_t* dst_row = dst_block + static_cast<size_t>(k4) * B * 4;
+            for (int b = 0; b < B; ++b) {
+                const int8_t* src = xq_total + static_cast<size_t>(block_begin + b) * d_model + k0 + k4 * 4;
+                memcpy(dst_row + b * 4, src, 4);
+            }
+        }
+    }
+
+    // Tile state is architectural per OpenMP worker, so load it here.
+    load_amx_shared_config(B);
+    for (int f = 0; f < d_ff; f += 16) {
+        _tile_zero(0);
+        _tile_zero(1);
+        for (int k0 = 0; k0 < d_model; k0 += 64) {
+            _tile_loadd(2, w_gate + static_cast<size_t>(f) * d_model + static_cast<size_t>(k0) * 16, 64);
+            _tile_loadd(3, w_up + static_cast<size_t>(f) * d_model + static_cast<size_t>(k0) * 16, 64);
+            _tile_loadd(4, x_tile + static_cast<size_t>(k0 / 4) * B * 4, B * 4);
+            _tile_dpbusd(0, 2, 4);
+            _tile_dpbusd(1, 3, 4);
+        }
+        _tile_stored(0, gate_acc, B * 4);
+        _tile_stored(1, up_acc, B * 4);
+
+        for (int i = 0; i < 16; ++i) {
+            alignas(64) float gate_values[16] = {};
+            alignas(64) float up_values[16] = {};
+            for (int b = 0; b < B; ++b) {
+                const int offset = i * B + b;
+                const int32_t correction = -128 * x_sum[b];
+                gate_values[b] = static_cast<float>(gate_acc[offset] + correction) *
+                                 (s_x_total[block_begin + b] * s_gate);
+                up_values[b] = static_cast<float>(up_acc[offset] + correction) *
+                               (s_x_total[block_begin + b] * s_up);
+            }
+            const __m512 vg = _mm512_load_ps(gate_values);
+            const __m512 vu = _mm512_load_ps(up_values);
+            const __m512 exp_neg_vg = exp512_approx_ps_amx(_mm512_sub_ps(_mm512_setzero_ps(), vg));
+            const __m512 silu = _mm512_div_ps(vg, _mm512_add_ps(_mm512_set1_ps(1.0f), exp_neg_vg));
+            alignas(64) float h_values[16];
+            _mm512_store_ps(h_values, _mm512_mul_ps(silu, vu));
+            for (int b = 0; b < B; ++b) {
+                const float value = h_values[b];
+                hidden[static_cast<size_t>(b) * d_ff + f + i] = value;
+                const float abs_value = value < 0.0f ? -value : value;
+                if (abs_value > h_amax[b]) h_amax[b] = abs_value;
+            }
+        }
+    }
+
+    for (int b = 0; b < B; ++b) {
+        s_h[b] = h_amax[b] > 0.0f ? h_amax[b] / 127.0f : 1.0f;
+        const __m512 inv_s_h = _mm512_set1_ps(h_amax[b] > 0.0f ? 127.0f / h_amax[b] : 1.0f);
+        int8_t* hq_token = hq + static_cast<size_t>(b) * d_ff;
+        const float* h_token = hidden + static_cast<size_t>(b) * d_ff;
+        for (int f = 0; f < d_ff; f += 16) {
+            const __m512i h_i32 = _mm512_cvt_roundps_epi32(
+                _mm512_mul_ps(_mm512_loadu_ps(h_token + f), inv_s_h),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(hq_token + f), _mm512_cvtsepi32_epi8(h_i32));
+        }
+        for (int f = 0; f < d_ff; ++f) hq_sum[b] += hq_token[f];
+    }
+
+    for (int f0 = 0; f0 < d_ff; f0 += 64) {
+        int8_t* dst_block = h_tile + static_cast<size_t>(f0 / 4) * B * 4;
+        for (int f4 = 0; f4 < 16; ++f4) {
+            int8_t* dst_row = dst_block + static_cast<size_t>(f4) * B * 4;
+            for (int b = 0; b < B; ++b) {
+                memcpy(dst_row + b * 4,
+                       hq + static_cast<size_t>(b) * d_ff + f0 + f4 * 4, 4);
+            }
+        }
+    }
+
+    for (int d = 0; d < d_model; d += 16) {
+        _tile_zero(0);
+        for (int f0 = 0; f0 < d_ff; f0 += 64) {
+            _tile_loadd(2, w_down + static_cast<size_t>(d) * d_ff + static_cast<size_t>(f0) * 16, 64);
+            _tile_loadd(4, h_tile + static_cast<size_t>(f0 / 4) * B * 4, B * 4);
+            _tile_dpbusd(0, 2, 4);
+        }
+        _tile_stored(0, down_acc, B * 4);
+        for (int i = 0; i < 16; ++i) {
+            for (int b = 0; b < B; ++b) {
+                const int32_t acc = down_acc[i * B + b] - 128 * hq_sum[b];
+                const float shared = static_cast<float>(acc) * (s_h[b] * s_down);
+                y[static_cast<size_t>(block_begin + b) * d_model + d + i] =
+                    x[static_cast<size_t>(block_begin + b) * d_model + d + i] + shared;
+            }
+        }
+    }
+    _tile_release();
 }
 
 #endif
@@ -88,6 +246,15 @@ void preprocess(MoEWeights& w) {
     };
 
     #if IS_AMX
+
+    // Shared matrices use AMX tile-native packing. Routed matrices below
+    // keep their existing AVX-512 VNNI packing for expert_ffn.
+    w_sh_gate_transpose = new uint8_t[(size_t)w.d_ff * w.d_model];
+    pack_amx_shared_weights(w.sh_gate, w_sh_gate_transpose, w.d_ff, w.d_model);
+    w_sh_up_transpose = new uint8_t[(size_t)w.d_ff * w.d_model];
+    pack_amx_shared_weights(w.sh_up, w_sh_up_transpose, w.d_ff, w.d_model);
+    w_sh_down_transpose = new uint8_t[(size_t)w.d_model * w.d_ff];
+    pack_amx_shared_weights(w.sh_down, w_sh_down_transpose, w.d_model, w.d_ff);
 
     #else
 
@@ -444,6 +611,19 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     // shared expert
 
     #if IS_AMX
+
+    // The common weights make the shared FFN a small GEMM: AMX columns are
+    // token lanes, so one tile operation handles up to 16 tokens. Every
+    // block writes a disjoint range of y and safely supports a short tail.
+    #pragma omp parallel for schedule(static)
+    for (int block_begin = 0; block_begin < num_tokens; block_begin += 16) {
+        const int B = (num_tokens - block_begin < 16) ?
+                      (num_tokens - block_begin) : 16;
+        shared_expert_amx_batch(x, y, w_sh_gate_transpose, w_sh_up_transpose,
+                                w_sh_down_transpose, w.sh_s_gate, w.sh_s_up,
+                                w.sh_s_down, xq_total, s_x_total, block_begin,
+                                B, d_model, d_ff);
+    }
 
     #endif
     // route expert
