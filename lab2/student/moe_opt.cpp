@@ -16,6 +16,7 @@
 #include "moe.h"
 #include <cstdint>     // int8_t
 #include <cstring>
+#include <cmath>        // INFINITY
 #include <riscv_vector.h>  // RVV intrinsics：vfloat32m2_t / vint32m2_t / __riscv_v*
 #include <cassert>
 #include <omp.h>
@@ -172,11 +173,11 @@ auto exp512_approx_ps = [](vfloat32m2_t x) -> vfloat32m2_t
 
     // Construct 2^n using float exponent bits.
     // float: exponent bias = 127, exponent field starts at bit 23.
-    const vint32m2_t pow2_bits = __riscv_vslli_vx_i32m2(
+    const vint32m2_t pow2_bits = __riscv_vsll_vx_i32m2(
         __riscv_vadd_vx_i32m2(n, 127, VL),
         23, VL);
 
-    const vfloat32m2_t pow2n = __riscv_vreinterpret_f32m2_i32m2(pow2_bits);
+    const vfloat32m2_t pow2n = __riscv_vreinterpret_v_f32m2_i32m2(pow2_bits);
 
     return __riscv_vfmul_vv_f32m2(p, pow2n, VL);
 };
@@ -205,7 +206,7 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
         vint32m1_t x_sum_vec = __riscv_vmv_v_x_i32m1(0, 1);
         for (int d = 0; d < d_model; d += 16) {
             vint8mf2_t xq_v = __riscv_vle8_v_i8mf2(xq + d, VL);
-            vint32m2_t xq_i32 = __riscv_vsext_vf4_i32m2_i8mf2(xq_v, VL);
+            vint32m2_t xq_i32 = __riscv_vsext_vf4_i32m2(xq_v, VL);
             x_sum_vec = __riscv_vredsum_vs_i32m2_i32m1(xq_i32, x_sum_vec, VL);
         }
         x_sum = __riscv_vmv_x_s_i32m1_i32(x_sum_vec);
@@ -239,8 +240,8 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
                 const vuint8mf2_t w_up_vec   = __riscv_vle8_v_u8mf2(w_up + tile, VL);
 
                 // calculate: acc[i] += w[i] * xq_k  (unsigned weight * signed activation)
-                gate_acc = __riscv_vwmaccus_vv_i32m2_u8mf2_i8mf2(gate_acc, w_gate_vec, xq_vec, VL);
-                up_acc   = __riscv_vwmaccus_vv_i32m2_u8mf2_i8mf2(up_acc,   w_up_vec,   xq_vec, VL);
+                gate_acc = __riscv_vwmaccus_vv_i32m2(gate_acc, w_gate_vec, xq_vec, VL);
+                up_acc   = __riscv_vwmaccus_vv_i32m2(up_acc,   w_up_vec,   xq_vec, VL);
 
             }
 
@@ -258,7 +259,7 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
 
     }
     h_amax = __riscv_vfmv_f_s_f32m1_f32(
-        __riscv_vredmax_vs_f32m2_f32m1(h_amax_vec, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), VL));
+        __riscv_vfredmax_vs_f32m2_f32m1(h_amax_vec, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), VL));
 
     // Requantize hidden activation to int8
     float s_h = (h_amax > 0.0f) ? h_amax / 127.0f : 1.0f;
@@ -266,11 +267,12 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
     int8_t hq[MAX_D_FF];
     for (int f = 0; f < d_ff; f+=16) {
         vfloat32m2_t h_vec = __riscv_vle32_v_f32m2(&h[f], VL);
+        vfloat32m2_t h_scaled = __riscv_vfmul_vf_f32m2(h_vec, r_s_h, VL);
         // round-to-nearest float -> int32
         vint32m2_t h_i32 = __riscv_vfcvt_x_f_v_i32m2(h_scaled, VL);
         // saturating narrow int32 -> int8 (vnclip.wi/wx with shift 0 narrows
         // with rounding+saturation; shift 0 => exact narrow of in-range values)
-        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2_i32m2(h_i32, 0, VL);
+        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(h_i32, 0, VL);
         __riscv_vse8_v_i8mf2(&hq[f], v_i8, VL);
     }
 
@@ -280,7 +282,7 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
         vint32m1_t hq_sum_vec = __riscv_vmv_v_x_i32m1(0, 1);
         for (int f = 0; f < d_ff; f += 16) {
             vint8mf2_t hq_v = __riscv_vle8_v_i8mf2(hq + f, VL);
-            vint32m2_t hq_i32 = __riscv_vsext_vf4_i32m2_i8mf2(hq_v, VL);
+            vint32m2_t hq_i32 = __riscv_vsext_vf4_i32m2(hq_v, VL);
             hq_sum_vec = __riscv_vredsum_vs_i32m2_i32m1(hq_i32, hq_sum_vec, VL);
         }
         hq_sum = __riscv_vmv_x_s_i32m1_i32(hq_sum_vec);
@@ -308,7 +310,7 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
                 const vuint8mf2_t w_down_vec = __riscv_vle8_v_u8mf2(w_down + tile, VL);
 
                 // calculate: acc[i] += w[i] * hq_k
-                acc = __riscv_vwmaccus_vv_i32m2_u8mf2_i8mf2(acc, w_down_vec, hq_vec, VL);
+                acc = __riscv_vwmaccus_vv_i32m2(acc, w_down_vec, hq_vec, VL);
             }
         }
         vfloat32m2_t acc_f = __riscv_vfmul_vf_f32m2(__riscv_vfcvt_f_x_v_f32m2(acc, VL), s_x_mul_down, VL);
@@ -357,7 +359,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             vfloat32m2_t neg_acc = __riscv_vfneg_v_f32m2(acc, VL);
             vfloat32m2_t exp_neg_acc = exp512_approx_ps(neg_acc);
             vfloat32m2_t denom = __riscv_vfadd_vf_f32m2(exp_neg_acc, 1.0f, VL);
-            vfloat32m2_t s_vec = __riscv_vfdiv_vf_f32m2(__riscv_vfmv_v_f_f32m2(1.0f, VL), denom, VL);
+            vfloat32m2_t s_vec = __riscv_vfdiv_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f, VL), denom, VL);
             __riscv_vse32_v_f32m2(&s[e], s_vec, VL);
             // s_add_bias[e] = w.bias[e] + s[e]
             /*
@@ -418,7 +420,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         }
         // reduce max
         x_amax = __riscv_vfmv_f_s_f32m1_f32(
-            __riscv_vredmax_vs_f32m2_f32m1(xt_vec_max, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), VL));
+            __riscv_vfredmax_vs_f32m2_f32m1(xt_vec_max, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), VL));
 
         // s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f
         float s_x = (x_amax > 0.0f) ? x_amax / 127.0f : 1.0f;
@@ -434,7 +436,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             // round-to-nearest float -> int32
             vint32m2_t v_i32 = __riscv_vfcvt_x_f_v_i32m2(xt_vec_now_scaled, VL);
             // saturating narrow int32 -> int8
-            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2_i32m2(v_i32, 0, VL);
+            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(v_i32, 0, VL);
             __riscv_vse8_v_i8mf2(&xq[d], v_i8, VL);
         }
 
