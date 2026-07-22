@@ -177,7 +177,7 @@ auto exp512_approx_ps = [](vfloat32m2_t x) -> vfloat32m2_t
         __riscv_vadd_vx_i32m2(n, 127, VL),
         23, VL);
 
-    const vfloat32m2_t pow2n = __riscv_vreinterpret_v_f32m2_i32m2(pow2_bits);
+    const vfloat32m2_t pow2n = __riscv_vreinterpret_v_i32m2_f32m2(pow2_bits);
 
     return __riscv_vfmul_vv_f32m2(p, pow2n, VL);
 };
@@ -225,11 +225,10 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
 
             const size_t k4_offset = static_cast<size_t>(k / 4) * 64;
 
-            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + broadcast + vwmaccus per K-index
+            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + scalar broadcast + vwmaccus per K-index
 
-                //read xq (broadcast scalar activation to 16 lanes)
+                //read xq (scalar activation for this K-index)
                 const int8_t xq_k = xq[k + j];
-                const vint8mf2_t xq_vec = __riscv_vmv_v_x_i8mf2(xq_k, VL);
 
                 // tile base for this 16-row / 4-K tile; K-index j is contiguous
                 const size_t tile = f_offset + k4_offset + (size_t)j * 16;
@@ -239,9 +238,9 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
                 // read w_up
                 const vuint8mf2_t w_up_vec   = __riscv_vle8_v_u8mf2(w_up + tile, VL);
 
-                // calculate: acc[i] += w[i] * xq_k  (unsigned weight * signed activation)
-                gate_acc = __riscv_vwmaccus_vv_i32m2(gate_acc, w_gate_vec, xq_vec, VL);
-                up_acc   = __riscv_vwmaccus_vv_i32m2(up_acc,   w_up_vec,   xq_vec, VL);
+                // calculate: acc[i] += xq_k * w[i]  (signed activation * unsigned weight)
+                gate_acc = __riscv_vwmaccus_vx_i32m2(gate_acc, xq_k, w_gate_vec, VL);
+                up_acc   = __riscv_vwmaccus_vx_i32m2(up_acc,   xq_k, w_up_vec,   VL);
 
             }
 
@@ -270,9 +269,10 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
         vfloat32m2_t h_scaled = __riscv_vfmul_vf_f32m2(h_vec, r_s_h, VL);
         // round-to-nearest float -> int32
         vint32m2_t h_i32 = __riscv_vfcvt_x_f_v_i32m2(h_scaled, VL);
-        // saturating narrow int32 -> int8 (vnclip.wi/wx with shift 0 narrows
-        // with rounding+saturation; shift 0 => exact narrow of in-range values)
-        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(h_i32, 0, VL);
+        // saturating narrow int32 -> int16 -> int8 (two 2x narrowing steps;
+        // vnclip with shift 0 saturates, matching _mm512_cvtsepi32_epi8)
+        vint16m1_t h_i16 = __riscv_vnclip_wx_i16m1(h_i32, 0, VL);
+        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(h_i16, 0, VL);
         __riscv_vse8_v_i8mf2(&hq[f], v_i8, VL);
     }
 
@@ -298,19 +298,18 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
 
             const size_t f4_offset = static_cast<size_t>(f / 4) * 64;
 
-            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + broadcast + vwmaccus per K-index
+            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + scalar broadcast + vwmaccus per K-index
 
-                //read hq (broadcast scalar activation to 16 lanes)
+                //read hq (scalar activation for this K-index)
                 const int8_t hq_k = hq[f + j];
-                const vint8mf2_t hq_vec = __riscv_vmv_v_x_i8mf2(hq_k, VL);
 
                 const size_t tile = d_offset + f4_offset + (size_t)j * 16;
 
                 // read w_down
                 const vuint8mf2_t w_down_vec = __riscv_vle8_v_u8mf2(w_down + tile, VL);
 
-                // calculate: acc[i] += w[i] * hq_k
-                acc = __riscv_vwmaccus_vv_i32m2(acc, w_down_vec, hq_vec, VL);
+                // calculate: acc[i] += hq_k * w[i]  (signed activation * unsigned weight)
+                acc = __riscv_vwmaccus_vx_i32m2(acc, hq_k, w_down_vec, VL);
             }
         }
         vfloat32m2_t acc_f = __riscv_vfmul_vf_f32m2(__riscv_vfcvt_f_x_v_f32m2(acc, VL), s_x_mul_down, VL);
@@ -435,8 +434,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             vfloat32m2_t xt_vec_now_scaled = __riscv_vfmul_vf_f32m2(xt_vec_now, r_s_x, VL);
             // round-to-nearest float -> int32
             vint32m2_t v_i32 = __riscv_vfcvt_x_f_v_i32m2(xt_vec_now_scaled, VL);
-            // saturating narrow int32 -> int8
-            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(v_i32, 0, VL);
+            // saturating narrow int32 -> int16 -> int8 (two 2x narrowing steps)
+            vint16m1_t v_i16 = __riscv_vnclip_wx_i16m1(v_i32, 0, VL);
+            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(v_i16, 0, VL);
             __riscv_vse8_v_i8mf2(&xq[d], v_i8, VL);
         }
 
