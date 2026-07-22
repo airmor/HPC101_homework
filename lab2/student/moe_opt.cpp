@@ -1,4 +1,4 @@
-// Main task: optimize the MoE forward pass.
+﻿// Main task: optimize the MoE forward pass.
 
 #include "moe.h"
 #include <cstdint>     // int8_t
