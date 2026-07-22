@@ -8,7 +8,7 @@
 #include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_*
 #include <cassert>
 #include <omp.h>
-#define IS_AMX 0
+#define IS_AMX 1
 
 float* w_router_transpose;
 uint8_t* w_sh_gate_transpose;
@@ -18,6 +18,8 @@ uint8_t* w_gate_transpose;
 uint8_t* w_up_transpose;
 uint8_t* w_down_transpose;
 
+#if IS_AMX
+
 struct alignas(64) amx_tilecfg {
     uint8_t  palette_id;
     uint8_t  start_row;
@@ -25,27 +27,33 @@ struct alignas(64) amx_tilecfg {
     uint16_t colsb[16];
     uint8_t  rows[16];
 };
-static inline void load_amx_gemv_config()
+static inline void load_amx_shared_config(int B)
 {
+    assert(B >= 1 && B <= 16);
     amx_tilecfg cfg{};
     cfg.palette_id = 1;
-    // tmm0: gate/down accumulator, 1 x 16 int32
-    cfg.rows[0]  = 1;
-    cfg.colsb[0] = 16 * sizeof(int32_t);   // 64 bytes
-    // tmm1: up accumulator, 1 x 16 int32
-    cfg.rows[1]  = 1;
-    cfg.colsb[1] = 16 * sizeof(int32_t);   // 64 bytes
-    // tmm2: activation, 1 x 64 int8
-    cfg.rows[2]  = 1;
+    // tmm0: gate/down accumulator
+    // 16 output channels × B int32
+    cfg.rows[0]  = 16;
+    cfg.colsb[0] = static_cast<uint16_t>(B * 4);
+    // tmm1: up accumulator
+    cfg.rows[1]  = 16;
+    cfg.colsb[1] = static_cast<uint16_t>(B * 4);
+    // tmm2: gate/down weights
+    // 16 output channels × 64 uint8
+    cfg.rows[2]  = 16;
     cfg.colsb[2] = 64;
-    // tmm3: gate/down weights, packed 16 x 64 bytes
+    // tmm3: up weights
     cfg.rows[3]  = 16;
     cfg.colsb[3] = 64;
-    // tmm4: up weights, packed 16 x 64 bytes
+    // tmm4: packed activations
+    // K/4 = 16 rows, each row contains B groups of 4 bytes
     cfg.rows[4]  = 16;
-    cfg.colsb[4] = 64;
+    cfg.colsb[4] = static_cast<uint16_t>(B * 4);
     _tile_loadconfig(&cfg);
 }
+
+#endif
 
 void preprocess(MoEWeights& w) {
     //change w.router to w.router_transpose
@@ -79,6 +87,10 @@ void preprocess(MoEWeights& w) {
         }
     };
 
+    #if IS_AMX
+
+    #else
+
     // Shared expert (same shape as one routed expert)
     w_sh_gate_transpose = new uint8_t[(size_t)w.d_ff * w.d_model];
     pack_vnni(w.sh_gate, w_sh_gate_transpose, w.d_ff, w.d_model);
@@ -86,6 +98,8 @@ void preprocess(MoEWeights& w) {
     pack_vnni(w.sh_up,   w_sh_up_transpose,   w.d_ff, w.d_model);
     w_sh_down_transpose = new uint8_t[(size_t)w.d_model * w.d_ff];
     pack_vnni(w.sh_down, w_sh_down_transpose, w.d_model, w.d_ff);
+
+    #endif
 
     // Routed experts: [num_experts][...]
     const size_t gate_up_size = (size_t)w.d_ff * w.d_model;
@@ -156,6 +170,14 @@ auto exp512_approx_ps = [](__m512 x) -> __m512
 
     return _mm512_mul_ps(p, pow2n);
 };
+
+static void expert_ffn_amx(const uint8_t* w_gate, const uint8_t* w_up,
+                      const uint8_t* w_down, float s_gate, float s_up,
+                      float s_down, const int8_t* xq, float s_x, float* out,
+                      int d_model, int d_ff) {
+
+
+}
 
 static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
                        const uint8_t* w_down, float s_gate, float s_up,
@@ -287,6 +309,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     omp_set_dynamic(0);
     omp_set_num_threads(4);
 
+    int8_t xq_total[MAX_NUM_TOKENS][MAX_D_MODEL] = {0};
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* xt = x + (size_t)t * d_model;
@@ -386,7 +409,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         float r_s_x = (x_amax > 0.0f) ? 127.0f / x_amax : 1.0f;
 
         // xq[d] = (int8_t)lrintf(xt[d] * r_s_x)
-        int8_t xq[MAX_D_MODEL];
+        int8_t* xq = xq_total[t];
         for (int d = 0; d < d_model; d+=16) {
             __m512 xt_vec_now = _mm512_loadu_ps(&xt[d]);
             __m512 xt_vec_now_scaled = _mm512_mul_ps(xt_vec_now, _mm512_set1_ps(r_s_x));
@@ -414,6 +437,8 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         */
 
         #if IS_AMX
+
+
             float o[MAX_D_MODEL];
             for (int k = 0; k < top_k; ++k) {
                 int e = topk_idx[k];
