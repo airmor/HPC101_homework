@@ -8,7 +8,6 @@
 #include <immintrin.h> // AVX-512 intrinsic：__m512 / _mm512_*
 #include <cassert>
 #include <omp.h>
-#define IS_AMX 0
 
 float* w_router_transpose;
 uint8_t* w_sh_gate_transpose;
@@ -17,35 +16,6 @@ uint8_t* w_sh_down_transpose;
 uint8_t* w_gate_transpose;
 uint8_t* w_up_transpose;
 uint8_t* w_down_transpose;
-
-struct alignas(64) amx_tilecfg {
-    uint8_t  palette_id;
-    uint8_t  start_row;
-    uint8_t  reserved[14];
-    uint16_t colsb[16];
-    uint8_t  rows[16];
-};
-static inline void load_amx_gemv_config()
-{
-    amx_tilecfg cfg{};
-    cfg.palette_id = 1;
-    // tmm0: gate/down accumulator, 1 x 16 int32
-    cfg.rows[0]  = 1;
-    cfg.colsb[0] = 16 * sizeof(int32_t);   // 64 bytes
-    // tmm1: up accumulator, 1 x 16 int32
-    cfg.rows[1]  = 1;
-    cfg.colsb[1] = 16 * sizeof(int32_t);   // 64 bytes
-    // tmm2: activation, 1 x 64 int8
-    cfg.rows[2]  = 1;
-    cfg.colsb[2] = 64;
-    // tmm3: gate/down weights, packed 16 x 64 bytes
-    cfg.rows[3]  = 16;
-    cfg.colsb[3] = 64;
-    // tmm4: up weights, packed 16 x 64 bytes
-    cfg.rows[4]  = 16;
-    cfg.colsb[4] = 64;
-    _tile_loadconfig(&cfg);
-}
 
 void preprocess(MoEWeights& w) {
     //change w.router to w.router_transpose
@@ -413,48 +383,29 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         * 
         */
 
-        #if IS_AMX
-            float o[MAX_D_MODEL];
-            for (int k = 0; k < top_k; ++k) {
-                int e = topk_idx[k];
-                float gate = s[e] / gate_sum;
-                expert_ffn(w_gate_transpose + (size_t)e * d_ff * d_model,
-                        w_up_transpose + (size_t)e * d_ff * d_model,
-                        w_down_transpose + (size_t)e * d_model * d_ff, w.s_gate[e],
-                        w.s_up[e], w.s_down[e], xq, s_x, o, d_model, d_ff);
-                for (int d = 0; d < d_model; d+=16) {
-                    __m512 o_vec = _mm512_loadu_ps(&o[d]);
-                    __m512 yt_vec = _mm512_loadu_ps(&yt[d]);
-                    __m512 gate_vec = _mm512_set1_ps(gate);
-                    __m512 yt_vec_updated = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_vec));
-                    _mm512_storeu_ps(&yt[d], yt_vec_updated);
-                }
-            }
-        #else
-            float o[MAX_D_MODEL];
-            expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose, w.sh_s_gate, w.sh_s_up,
-                    w.sh_s_down, xq, s_x, o, d_model, d_ff);
-            for (int d = 0; d < d_model; d+=16) {
+        float o[MAX_D_MODEL];
+        expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose, w.sh_s_gate, w.sh_s_up,
+                   w.sh_s_down, xq, s_x, o, d_model, d_ff);
+        for (int d = 0; d < d_model; d += 16){
+            __m512 o_vec = _mm512_loadu_ps(&o[d]);
+            __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
+            __m512 yt_vec = _mm512_add_ps(xt_vec, o_vec);
+            _mm512_storeu_ps(&yt[d], yt_vec);
+        }
+        for (int k = 0; k < top_k; ++k){
+            int e = topk_idx[k];
+            float gate = s[e] / gate_sum;
+            expert_ffn(w_gate_transpose + (size_t)e * d_ff * d_model,
+                       w_up_transpose + (size_t)e * d_ff * d_model,
+                       w_down_transpose + (size_t)e * d_model * d_ff, w.s_gate[e],
+                       w.s_up[e], w.s_down[e], xq, s_x, o, d_model, d_ff);
+            for (int d = 0; d < d_model; d += 16){
                 __m512 o_vec = _mm512_loadu_ps(&o[d]);
-                __m512 xt_vec = _mm512_loadu_ps(&xt[d]);
-                __m512 yt_vec = _mm512_add_ps(xt_vec, o_vec);
-                _mm512_storeu_ps(&yt[d], yt_vec);
+                __m512 yt_vec = _mm512_loadu_ps(&yt[d]);
+                __m512 gate_vec = _mm512_set1_ps(gate);
+                __m512 yt_vec_updated = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_vec));
+                _mm512_storeu_ps(&yt[d], yt_vec_updated);
             }
-            for (int k = 0; k < top_k; ++k) {
-                int e = topk_idx[k];
-                float gate = s[e] / gate_sum;
-                expert_ffn(w_gate_transpose + (size_t)e * d_ff * d_model,
-                        w_up_transpose + (size_t)e * d_ff * d_model,
-                        w_down_transpose + (size_t)e * d_model * d_ff, w.s_gate[e],
-                        w.s_up[e], w.s_down[e], xq, s_x, o, d_model, d_ff);
-                for (int d = 0; d < d_model; d+=16) {
-                    __m512 o_vec = _mm512_loadu_ps(&o[d]);
-                    __m512 yt_vec = _mm512_loadu_ps(&yt[d]);
-                    __m512 gate_vec = _mm512_set1_ps(gate);
-                    __m512 yt_vec_updated = _mm512_add_ps(yt_vec, _mm512_mul_ps(gate_vec, o_vec));
-                    _mm512_storeu_ps(&yt[d], yt_vec_updated);
-                }
-            }
-        #endif
+        }
     }
 }
