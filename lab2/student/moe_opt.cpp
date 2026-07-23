@@ -156,20 +156,24 @@ auto exp512_approx_ps = [](vfloat32m2_t x) -> vfloat32m2_t
     const vint32m2_t n = __riscv_vfcvt_x_f_v_i32m2(y, VL);
     const vfloat32m2_t nf = __riscv_vfcvt_f_x_v_f32m2(n, VL);
 
-    // r = x - nf * ln2  (fnmacc: vd = -(vs1*vs2) + vd)
-    vfloat32m2_t r = __riscv_vfnmacc_vv_f32m2(x, nf, ln2_hi, VL);
-    r = __riscv_vfnmacc_vv_f32m2(r, nf, ln2_lo, VL);
+    // r = x - nf * ln2
+    // vfmsac_vv(vd, vs1, vs2): vd = vs1*vs2 - vd  => (nf*ln2 - x) = -(x - nf*ln2)
+    vfloat32m2_t neg_r = __riscv_vfmsac_vv_f32m2(x, nf, ln2_hi, VL);
+    vfloat32m2_t r = __riscv_vfneg_v_f32m2(neg_r, VL);
+    vfloat32m2_t neg_r2 = __riscv_vfmsac_vv_f32m2(r, nf, ln2_lo, VL);
+    r = __riscv_vfneg_v_f32m2(neg_r2, VL);
 
     // exp(r) polynomial approximation.
     // 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720
-    // fmacc vv: vd = vs1*vs2 + vd  ->  p = coeff + p*r
+    // Horner: p = coeff + r*prev.  vfmacc_vv(vd, vs1, vs2): vd = vs1*vs2 + vd
+    //  => vd=coeff, vs1=r, vs2=prev_p
     vfloat32m2_t p = __riscv_vfmv_v_f_f32m2(1.0f / 720.0f, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 120.0f, VL), p, r, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 24.0f,  VL), p, r, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 6.0f,   VL), p, r, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 2.0f,   VL), p, r, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f,           VL), p, r, VL);
-    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f,           VL), p, r, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 120.0f, VL), r, p, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 24.0f,  VL), r, p, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 6.0f,   VL), r, p, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f / 2.0f,   VL), r, p, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f,           VL), r, p, VL);
+    p = __riscv_vfmacc_vv_f32m2(__riscv_vfmv_v_f_f32m2(1.0f,           VL), r, p, VL);
 
     // Construct 2^n using float exponent bits.
     // float: exponent bias = 127, exponent field starts at bit 23.
@@ -225,7 +229,7 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
 
             const size_t k4_offset = static_cast<size_t>(k / 4) * 64;
 
-            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + scalar broadcast + vwmaccus per K-index
+            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + widen + vwmaccsu per K-index
 
                 //read xq (scalar activation for this K-index)
                 const int8_t xq_k = xq[k + j];
@@ -233,14 +237,16 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
                 // tile base for this 16-row / 4-K tile; K-index j is contiguous
                 const size_t tile = f_offset + k4_offset + (size_t)j * 16;
 
-                // read w_gate (16 unsigned weights for this K-index)
-                const vuint8mf2_t w_gate_vec = __riscv_vle8_v_u8mf2(w_gate + tile, VL);
+                // read w_gate (16 unsigned weights for this K-index), widen u8->u16
+                const vuint8mf2_t w_gate_u8 = __riscv_vle8_v_u8mf2(w_gate + tile, VL);
+                const vuint16m1_t w_gate_vec = __riscv_vzext_vf2_u16m1(w_gate_u8, VL);
                 // read w_up
-                const vuint8mf2_t w_up_vec   = __riscv_vle8_v_u8mf2(w_up + tile, VL);
+                const vuint8mf2_t w_up_u8   = __riscv_vle8_v_u8mf2(w_up + tile, VL);
+                const vuint16m1_t w_up_vec   = __riscv_vzext_vf2_u16m1(w_up_u8, VL);
 
-                // calculate: acc[i] += xq_k * w[i]  (signed activation * unsigned weight)
-                gate_acc = __riscv_vwmaccus_vx_i32m2(gate_acc, xq_k, w_gate_vec, VL);
-                up_acc   = __riscv_vwmaccus_vx_i32m2(up_acc,   xq_k, w_up_vec,   VL);
+                // calculate: acc[i] += xq_k(signed) * w[i](unsigned)
+                gate_acc = __riscv_vwmaccsu_vx_i32m2(gate_acc, xq_k, w_gate_vec, VL);
+                up_acc   = __riscv_vwmaccsu_vx_i32m2(up_acc,   xq_k, w_up_vec,   VL);
 
             }
 
@@ -270,9 +276,10 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
         // round-to-nearest float -> int32
         vint32m2_t h_i32 = __riscv_vfcvt_x_f_v_i32m2(h_scaled, VL);
         // saturating narrow int32 -> int16 -> int8 (two 2x narrowing steps;
-        // vnclip with shift 0 saturates, matching _mm512_cvtsepi32_epi8)
-        vint16m1_t h_i16 = __riscv_vnclip_wx_i16m1(h_i32, 0, VL);
-        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(h_i16, 0, VL);
+        // vnclip with shift 0 saturates, matching _mm512_cvtsepi32_epi8;
+        // __RISCV_VXRM_RNU = round-to-nearest-up, matches the round() intent)
+        vint16m1_t h_i16 = __riscv_vnclip_wx_i16m1(h_i32, 0, __RISCV_VXRM_RNU, VL);
+        vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(h_i16, 0, __RISCV_VXRM_RNU, VL);
         __riscv_vse8_v_i8mf2(&hq[f], v_i8, VL);
     }
 
@@ -298,18 +305,19 @@ static void expert_ffn(const uint8_t* w_gate, const uint8_t* w_up,
 
             const size_t f4_offset = static_cast<size_t>(f / 4) * 64;
 
-            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + scalar broadcast + vwmaccus per K-index
+            for (int j = 0; j < 4; ++j) { // RVV: one vle8 + widen + vwmaccsu per K-index
 
                 //read hq (scalar activation for this K-index)
                 const int8_t hq_k = hq[f + j];
 
                 const size_t tile = d_offset + f4_offset + (size_t)j * 16;
 
-                // read w_down
-                const vuint8mf2_t w_down_vec = __riscv_vle8_v_u8mf2(w_down + tile, VL);
+                // read w_down, widen u8->u16
+                const vuint8mf2_t w_down_u8 = __riscv_vle8_v_u8mf2(w_down + tile, VL);
+                const vuint16m1_t w_down_vec = __riscv_vzext_vf2_u16m1(w_down_u8, VL);
 
-                // calculate: acc[i] += hq_k * w[i]  (signed activation * unsigned weight)
-                acc = __riscv_vwmaccus_vx_i32m2(acc, hq_k, w_down_vec, VL);
+                // calculate: acc[i] += hq_k(signed) * w[i](unsigned)
+                acc = __riscv_vwmaccsu_vx_i32m2(acc, hq_k, w_down_vec, VL);
             }
         }
         vfloat32m2_t acc_f = __riscv_vfmul_vf_f32m2(__riscv_vfcvt_f_x_v_f32m2(acc, VL), s_x_mul_down, VL);
@@ -435,8 +443,8 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             // round-to-nearest float -> int32
             vint32m2_t v_i32 = __riscv_vfcvt_x_f_v_i32m2(xt_vec_now_scaled, VL);
             // saturating narrow int32 -> int16 -> int8 (two 2x narrowing steps)
-            vint16m1_t v_i16 = __riscv_vnclip_wx_i16m1(v_i32, 0, VL);
-            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(v_i16, 0, VL);
+            vint16m1_t v_i16 = __riscv_vnclip_wx_i16m1(v_i32, 0, __RISCV_VXRM_RNU, VL);
+            vint8mf2_t v_i8 = __riscv_vnclip_wx_i8mf2(v_i16, 0, __RISCV_VXRM_RNU, VL);
             __riscv_vse8_v_i8mf2(&xq[d], v_i8, VL);
         }
 
