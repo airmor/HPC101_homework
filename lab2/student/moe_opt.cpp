@@ -9,6 +9,17 @@
 #include <immintrin.h>
 #include <omp.h>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILE_DATA
+#define XFEATURE_XTILE_DATA 18
+#endif
+#endif
+
 // AMX code is compiled only when the compiler enabled the AMX ISA.  This keeps
 // the AVX-512 fallback buildable on machines/toolchains without AMX support.
 #if defined(__AMX_TILE__) && defined(__AMX_INT8__)
@@ -17,10 +28,31 @@
 #define USE_AMX 0
 #endif
 
+#if USE_AMX && defined(__linux__)
+// AMX tile data (XFEATURE_XTILE_DATA) is permission-gated by the kernel on
+// Sapphire Rapids.  The first execution of an AMX instruction other than
+// LDTILECFG/STTILECFG/TILERELEASE raises SIGILL unless the process has
+// previously requested the feature via arch_prctl(ARCH_REQ_XCOMP_PERM).
+// Request it once per process (thread-safe via the std::call_once guard).
+#include <mutex>
+static std::once_flag g_amx_perm_flag;
+static inline void amx_request_permission() {
+    std::call_once(g_amx_perm_flag, [] {
+        syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILE_DATA);
+    });
+}
+#endif
+
 float* w_router_transpose;
 uint8_t* w_sh_gate_transpose;
 uint8_t* w_sh_up_transpose;
 uint8_t* w_sh_down_transpose;
+// VNNI-packed shared expert, used by the small-batch path that folds the
+// shared expert into the same parallel pool as the routed experts (AMX
+// batching only pays off when a full 16-token tile can be filled).
+uint8_t* w_sh_gate_vnni;
+uint8_t* w_sh_up_vnni;
+uint8_t* w_sh_down_vnni;
 uint8_t* w_gate_transpose;
 uint8_t* w_up_transpose;
 uint8_t* w_down_transpose;
@@ -35,6 +67,10 @@ alignas(64) static float score_workspace[MAX_NUM_TOKENS * MAX_NUM_EXPERTS];
 alignas(64) static int topk_workspace[MAX_NUM_TOKENS * MAX_TOP_K];
 alignas(64) static float gate_sum_workspace[MAX_NUM_TOKENS];
 alignas(64) static float x_scale_workspace[MAX_NUM_TOKENS];
+// Per-token, per-expert-slot FFN outputs for the small-batch combine path.
+// Slot 0 is the shared expert (gate = 1); slots 1..K are the routed experts.
+alignas(64) static float expert_out_workspace[MAX_NUM_TOKENS *
+                                               (MAX_TOP_K + 1) * MAX_D_MODEL];
 
 static inline __m512 exp512_approx_ps(__m512 x) {
     x = _mm512_min_ps(x, _mm512_set1_ps(88.3762626647949f));
@@ -111,6 +147,26 @@ static inline void load_amx_shared_config(int tokens_in_block) {
     _tile_loadconfig(&cfg);
 }
 
+// Pack a single token's int8 activation into AMX's expected layout for the
+// "A" matrix in C[M,N] += A[M,K]*B[K,N].  Here the activation is the B side
+// of a token-major matmul, so we lay out [K/4][B*4] groups of 4 contiguous
+// bytes per token.  Used to lift a single routed-expert token batch into a
+// dense AMX GEMM when tokens for one expert are scarce.
+static inline void pack_token_amx_b(const int8_t* __restrict xq,
+                                    int8_t* __restrict dst,
+                                    int B, int d_model) {
+    // dst layout: for each 4-K group, B tokens' 4 bytes contiguously.
+    for (int k0 = 0; k0 < d_model; k0 += 64) {
+        int8_t* const dst_block = dst + static_cast<size_t>(k0 / 4) * B * 4;
+        for (int k4 = 0; k4 < 16; ++k4) {
+            int8_t* const dst_row = dst_block + static_cast<size_t>(k4) * B * 4;
+            for (int b = 0; b < B; ++b) {
+                std::memcpy(dst_row + b * 4, xq + static_cast<size_t>(b) * MAX_D_MODEL + k0 + k4 * 4, 4);
+            }
+        }
+    }
+}
+
 // AMX consumes one 16x64 byte tile at a time.  The layout is different from
 // VNNI's 16-output-channel x 4-K packing used for routed experts.
 static void pack_amx_weights(const int8_t* src, uint8_t* dst,
@@ -156,7 +212,10 @@ static void shared_expert_amx_batch(const float* __restrict x,
     float s_h[16] = {};
 
     for (int b = 0; b < B; ++b) {
-        x_sum[b] = sum_int8(xq_total + static_cast<size_t>(block_begin + b) * d_model,
+        // xq_workspace is laid out with stride MAX_D_MODEL per token (see the
+        // quantization stage), NOT d_model.  Indexing by d_model here was a
+        // stride bug that corrupted every token except the first.
+        x_sum[b] = sum_int8(xq_total + static_cast<size_t>(block_begin + b) * MAX_D_MODEL,
                              d_model);
     }
     for (int k0 = 0; k0 < d_model; k0 += 64) {
@@ -164,7 +223,7 @@ static void shared_expert_amx_batch(const float* __restrict x,
         for (int k4 = 0; k4 < 16; ++k4) {
             int8_t* const dst_row = dst_block + static_cast<size_t>(k4) * B * 4;
             for (int b = 0; b < B; ++b) {
-                const int8_t* src = xq_total + static_cast<size_t>(block_begin + b) * d_model + k0 + k4 * 4;
+                const int8_t* src = xq_total + static_cast<size_t>(block_begin + b) * MAX_D_MODEL + k0 + k4 * 4;
                 std::memcpy(dst_row + b * 4, src, 4);
             }
         }
@@ -274,23 +333,59 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
     const __m512 up_scale = _mm512_set1_ps(s_x * s_up);
     __m512 h_amax_vec = _mm512_setzero_ps();
 
+    // Fuse gate and up weight loads by walking them together: each k-group
+    // reuses the same 4-byte xq broadcast for both projections, so loading
+    // xq once (already done per k) and issuing back-to-back dpbusd lets the
+    // two independent accumulators pipeline on the VNNI ports.
+    const int k_groups = d_model / 4;
     for (int f = 0; f < d_ff; f += 16) {
         __m512i gate_acc = x_correction;
         __m512i up_acc = x_correction;
         const size_t f_offset = static_cast<size_t>(f) * d_model;
-        for (int k = 0; k < d_model; k += 4) {
+        // Unroll the K reduction by 4 to expose more independent dpbusd
+        // ops (8 acc chains per unroll body) so the VNNI ports and the load
+        // ports overlap while the accumulator dependency chain stays short
+        // relative to the pipeline depth.
+        int k = 0;
+        for (; k + 3 < k_groups; k += 4) {
+            uint32_t x4[4];
+            std::memcpy(x4, xq + k * 4, sizeof(x4));
+            const __m512i xa = _mm512_set1_epi32(static_cast<int32_t>(x4[0]));
+            const __m512i xb = _mm512_set1_epi32(static_cast<int32_t>(x4[1]));
+            const __m512i xc = _mm512_set1_epi32(static_cast<int32_t>(x4[2]));
+            const __m512i xd = _mm512_set1_epi32(static_cast<int32_t>(x4[3]));
+            const size_t o0 = static_cast<size_t>(k) * 64;
+            const size_t o1 = static_cast<size_t>(k + 1) * 64;
+            const size_t o2 = static_cast<size_t>(k + 2) * 64;
+            const size_t o3 = static_cast<size_t>(k + 3) * 64;
+            const __m512i wg0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o0));
+            const __m512i wg1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o1));
+            const __m512i wg2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o2));
+            const __m512i wg3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o3));
+            const __m512i wu0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o0));
+            const __m512i wu1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o1));
+            const __m512i wu2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o2));
+            const __m512i wu3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o3));
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg0, xa);
+            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu0, xa);
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg1, xb);
+            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu1, xb);
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg2, xc);
+            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu2, xc);
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg3, xd);
+            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu3, xd);
+        }
+        for (; k < k_groups; ++k) {
             uint32_t x4;
-            std::memcpy(&x4, xq + k, sizeof(x4));
+            std::memcpy(&x4, xq + k * 4, sizeof(x4));
             const __m512i x4_i32 = _mm512_set1_epi32(static_cast<int32_t>(x4));
-            const size_t k4_offset = static_cast<size_t>(k / 4) * 64;
-            gate_acc = _mm512_dpbusd_epi32(
-                gate_acc,
-                _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + k4_offset)),
-                x4_i32);
-            up_acc = _mm512_dpbusd_epi32(
-                up_acc,
-                _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + k4_offset)),
-                x4_i32);
+            const size_t k4_offset = static_cast<size_t>(k) * 64;
+            const __m512i wg = _mm512_loadu_si512(
+                reinterpret_cast<const __m512i*>(w_gate + f_offset + k4_offset));
+            const __m512i wu = _mm512_loadu_si512(
+                reinterpret_cast<const __m512i*>(w_up + f_offset + k4_offset));
+            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg, x4_i32);
+            up_acc = _mm512_dpbusd_epi32(up_acc, wu, x4_i32);
         }
         const __m512 vg = _mm512_mul_ps(gate_scale, _mm512_cvtepi32_ps(gate_acc));
         const __m512 vu = _mm512_mul_ps(up_scale, _mm512_cvtepi32_ps(up_acc));
@@ -316,14 +411,38 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
     const int32_t hq_sum = sum_int8(hq, d_ff);
     const __m512i h_correction = _mm512_set1_epi32(-128 * hq_sum);
     const __m512 down_scale = _mm512_set1_ps(s_h * s_down);
+    const int f_groups = d_ff / 4;
+    // The down projection's K dimension is d_ff.  Unrolling by 4 keeps the
+    // VNNI ports fed with independent acc chains, matching the gate/up loop.
     for (int d = 0; d < d_model; d += 16) {
         __m512i acc = h_correction;
         const size_t d_offset = static_cast<size_t>(d) * d_ff;
-        for (int f = 0; f < d_ff; f += 4) {
+        int g = 0;
+        for (; g + 3 < f_groups; g += 4) {
+            uint32_t hq4[4];
+            std::memcpy(hq4, hq + g * 4, sizeof(hq4));
+            const __m512i qa = _mm512_set1_epi32(static_cast<int32_t>(hq4[0]));
+            const __m512i qb = _mm512_set1_epi32(static_cast<int32_t>(hq4[1]));
+            const __m512i qc = _mm512_set1_epi32(static_cast<int32_t>(hq4[2]));
+            const __m512i qd = _mm512_set1_epi32(static_cast<int32_t>(hq4[3]));
+            const size_t o0 = static_cast<size_t>(g) * 64;
+            const size_t o1 = static_cast<size_t>(g + 1) * 64;
+            const size_t o2 = static_cast<size_t>(g + 2) * 64;
+            const size_t o3 = static_cast<size_t>(g + 3) * 64;
+            const __m512i w0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o0));
+            const __m512i w1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o1));
+            const __m512i w2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o2));
+            const __m512i w3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o3));
+            acc = _mm512_dpbusd_epi32(acc, w0, qa);
+            acc = _mm512_dpbusd_epi32(acc, w1, qb);
+            acc = _mm512_dpbusd_epi32(acc, w2, qc);
+            acc = _mm512_dpbusd_epi32(acc, w3, qd);
+        }
+        for (; g < f_groups; ++g) {
             uint32_t hq4;
-            std::memcpy(&hq4, hq + f, sizeof(hq4));
+            std::memcpy(&hq4, hq + g * 4, sizeof(hq4));
             const __m512i hq4_i32 = _mm512_set1_epi32(static_cast<int32_t>(hq4));
-            const size_t f4_offset = static_cast<size_t>(f / 4) * 64;
+            const size_t f4_offset = static_cast<size_t>(g) * 64;
             acc = _mm512_dpbusd_epi32(
                 acc,
                 _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + f4_offset)),
@@ -356,6 +475,15 @@ void preprocess(MoEWeights& w) {
     pack_amx_weights(w.sh_gate, w_sh_gate_transpose, w.d_ff, w.d_model);
     pack_amx_weights(w.sh_up, w_sh_up_transpose, w.d_ff, w.d_model);
     pack_amx_weights(w.sh_down, w_sh_down_transpose, w.d_model, w.d_ff);
+    // Also keep a VNNI copy of the shared expert for the small-batch path,
+    // where packing one token into a 16-wide AMX tile wastes 15/16 of the
+    // compute.  VNNI processes a single token with no padding.
+    w_sh_gate_vnni = new uint8_t[gate_up_size];
+    w_sh_up_vnni = new uint8_t[gate_up_size];
+    w_sh_down_vnni = new uint8_t[down_size];
+    pack_vnni_weights(w.sh_gate, w_sh_gate_vnni, w.d_ff, w.d_model);
+    pack_vnni_weights(w.sh_up, w_sh_up_vnni, w.d_ff, w.d_model);
+    pack_vnni_weights(w.sh_down, w_sh_down_vnni, w.d_model, w.d_ff);
 #else
     pack_vnni_weights(w.sh_gate, w_sh_gate_transpose, w.d_ff, w.d_model);
     pack_vnni_weights(w.sh_up, w_sh_up_transpose, w.d_ff, w.d_model);
@@ -380,6 +508,9 @@ void preprocess(MoEWeights& w) {
 
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
+#if USE_AMX && defined(__linux__)
+    amx_request_permission();
+#endif
     const int d_model = w.d_model;
     const int d_ff = w.d_ff;
     const int num_experts = w.num_experts;
@@ -387,12 +518,20 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 
     // Stage 1: router, Top-K metadata, and quantization.  All output arrays
     // are indexed by token, hence this is race-free and allocation-free.
+    // For tiny N (S1/S2: one token) the router and top-K are pure overhead
+    // with no parallelism to exploit, so run them serially to skip the
+    // OpenMP fork/join.  Larger N parallelizes across tokens.
 #pragma omp parallel for if (num_tokens >= 4) schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* const xt = x + static_cast<size_t>(t) * d_model;
         float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
         int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
 
+        // Router GEMV: for each 16-expert block, dot the token with the
+        // 16 expert rows.  w_router_transpose was laid out so that for a
+        // fixed dimension d, the 16 experts' weights are contiguous
+        // ([block][d*16 + lane]); the token's value at d must be broadcast
+        // to all 16 lanes, so we use the scalar broadcast form.
         for (int e = 0; e < g_router_padded_experts; e += 16) {
             __m512 acc = _mm512_setzero_ps();
             const float* const router_block = w_router_transpose + static_cast<size_t>(e) * d_model;
@@ -440,58 +579,80 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         }
     }
 
-    // Stage 2: the shared expert is common to all tokens.  Use AMX across a
-    // 16-token batch; the fallback preserves the same VNNI implementation.
+    // Stage 2 + 3: compute every (token, expert-slot) FFN in parallel, then
+    // combine.  We organize the (token, slot) task space so adjacent tasks
+    // share the same token (slot is the inner index): the same xq and the
+    // shared-expert slot reuse the cache line just written by the
+    // quantization stage, and tokens iterated in the outer index keep the
+    // per-token outputs contiguous for the combine reduction.
+    const int slots = top_k + 1;  // slot 0 = shared, 1..K = routed
+    const int total_tasks = num_tokens * slots;
+
+    // The (token, slot) FFN loop's work per task is uniform, but its task
+    // count varies wildly with N (5 for S1, 3072 for S4).  Cap the team size
+    // so small-N cases don't pay OpenMP's per-thread overhead for threads
+    // that have nothing to do, while large-N cases still scale out.
+    const int ffn_threads_cap = (total_tasks < 64) ? total_tasks : 16;
+#pragma omp parallel for if (total_tasks >= 2) schedule(static) num_threads(ffn_threads_cap)
+    for (int task = 0; task < total_tasks; ++task) {
+        const int t = task / slots;
+        const int slot = task % slots;
+        const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+        float* const out = expert_out_workspace +
+                           static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                           static_cast<size_t>(slot) * MAX_D_MODEL;
+
+        if (slot == 0) {
+            // Shared expert (gate weight = 1, applied in combine).
 #if USE_AMX
-    const int blocks = (num_tokens + 15) / 16;
-#pragma omp parallel for if (blocks > 1) schedule(static)
-    for (int block = 0; block < blocks; ++block) {
-        const int block_begin = block * 16;
-        const int B = (num_tokens - block_begin < 16) ? num_tokens - block_begin : 16;
-        shared_expert_amx_batch(x, y, w_sh_gate_transpose, w_sh_up_transpose,
-                                w_sh_down_transpose, w.sh_s_gate, w.sh_s_up,
-                                w.sh_s_down, xq_workspace, x_scale_workspace,
-                                block_begin, B, d_model, d_ff);
-    }
+            expert_ffn(w_sh_gate_vnni, w_sh_up_vnni, w_sh_down_vnni,
+                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
+                       x_scale_workspace[t], out, d_model, d_ff);
 #else
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
-    for (int t = 0; t < num_tokens; ++t) {
-        alignas(64) float out[MAX_D_MODEL];
-        const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
-        expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose,
-                   w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
-                   x_scale_workspace[t], out, d_model, d_ff);
-        const float* const xt = x + static_cast<size_t>(t) * d_model;
-        float* const yt = y + static_cast<size_t>(t) * d_model;
-        for (int d = 0; d < d_model; d += 16) {
-            _mm512_storeu_ps(yt + d, _mm512_add_ps(_mm512_loadu_ps(xt + d),
-                                                    _mm512_loadu_ps(out + d)));
-        }
-    }
+            expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose,
+                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
+                       x_scale_workspace[t], out, d_model, d_ff);
 #endif
-
-    // Stage 3: routed experts were previously serial, leaving most CPU cores
-    // idle after the AMX shared pass.  Tokens are independent, so parallelize
-    // this expensive top-k FFN work as well.
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
-    for (int t = 0; t < num_tokens; ++t) {
-        alignas(64) float out[MAX_D_MODEL];
-        const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
-        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
-        float* const yt = y + static_cast<size_t>(t) * d_model;
-        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
-
-        for (int k = 0; k < top_k; ++k) {
-            const int e = topk_idx[k];
+        } else {
+            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+            const int e = topk_idx[slot - 1];
             expert_ffn(w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model,
                        w_up_transpose + static_cast<size_t>(e) * d_ff * d_model,
                        w_down_transpose + static_cast<size_t>(e) * d_model * d_ff,
                        w.s_gate[e], w.s_up[e], w.s_down[e], xq,
                        x_scale_workspace[t], out, d_model, d_ff);
+        }
+    }
+
+    // Combine: y_t = x_t + 1*o_shared + sum_k gate_k * o_k.  Fused into a
+    // single parallel region with the FFN stage via nowait so tokens whose
+    // FFN work is done can start combining without waiting for the rest.
+    // (The dependency is per-token: combine[t] only reads expert_out[t],
+    // which that same task wrote.  We still need the per-token barrier that
+    // the second loop's omp for provides, so we keep two loops in one
+    // region rather than adding nowait.)
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+
+        // Start from residual + shared expert (gate 1).
+        const float* o_shared = outs;
+        for (int d = 0; d < d_model; d += 16) {
+            _mm512_storeu_ps(yt + d, _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                                    _mm512_loadu_ps(o_shared + d)));
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
             const __m512 gate = _mm512_set1_ps(scores[e] * inv_gate_sum);
+            const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
             for (int d = 0; d < d_model; d += 16) {
-                _mm512_storeu_ps(yt + d, _mm512_fmadd_ps(gate, _mm512_loadu_ps(out + d),
+                _mm512_storeu_ps(yt + d, _mm512_fmadd_ps(gate, _mm512_loadu_ps(o_k + d),
                                                           _mm512_loadu_ps(yt + d)));
             }
         }
