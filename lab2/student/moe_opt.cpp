@@ -8,6 +8,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <omp.h>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -44,6 +45,11 @@ static inline void amx_request_permission() {
 #endif
 
 float* w_router_transpose;
+// Router weights quantized and packed as 16 output rows x 4-K-byte groups
+// for VNNI.  The +128 encoding is corrected with the token xq sum in the
+// kernel, exactly as in the expert W8A8 projections.
+uint8_t* w_router_vnni;
+float* s_router;
 uint8_t* w_sh_gate_transpose;
 uint8_t* w_sh_up_transpose;
 uint8_t* w_sh_down_transpose;
@@ -71,6 +77,25 @@ alignas(64) static float x_scale_workspace[MAX_NUM_TOKENS];
 // Slot 0 is the shared expert (gate = 1); slots 1..K are the routed experts.
 alignas(64) static float expert_out_workspace[MAX_NUM_TOKENS *
                                                (MAX_TOP_K + 1) * MAX_D_MODEL];
+
+// Per-token sum of quantized activations (for the int8 x_correction term
+// used by the VNNI gate/up dot products).  Shared across all expert slots
+// of a token because xq is per-token.
+alignas(64) static int32_t x_sum_workspace[MAX_NUM_TOKENS];
+
+// Intra-FFN workspaces: when N is tiny (S1/S2: one token, 5 (token,slot)
+// tasks), the (token, slot) task space is too small to fill 16 threads.  We
+// split each expert_ffn internally across threads — gate/up by 16-wide
+// f-block, down by 16-wide d-block — which requires per-(token, slot)
+// hidden-state buffers instead of stack arrays.  The three-stage pipeline
+// (gate/up → reduce+requant → down) has two barriers but turns 5 tasks into
+// 5×(d_ff/16 + d_model/16) fine-grained tasks.
+alignas(64) static float intra_h[MAX_NUM_TOKENS * (MAX_TOP_K + 1) * MAX_D_FF];
+alignas(64) static int8_t intra_hq[MAX_NUM_TOKENS * (MAX_TOP_K + 1) * MAX_D_FF];
+alignas(64) static float intra_fblock_amax[MAX_NUM_TOKENS * (MAX_TOP_K + 1) *
+                                           (MAX_D_FF / 16)];
+alignas(64) static float intra_s_h[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int32_t intra_hq_sum[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
 
 static inline __m512 exp512_approx_ps(__m512 x) {
     x = _mm512_min_ps(x, _mm512_set1_ps(88.3762626647949f));
@@ -123,7 +148,40 @@ static void pack_vnni_weights(const int8_t* src, uint8_t* dst,
         }
     }
 }
-
+// Quantize fp32 router weights per expert row and pack them in the VNNI
+// layout: [16 rows][d_model / 4 groups][4 bytes].  The stored uint8 values
+// are q + 128; router GEMV subtracts 128 * sum(xq) from every accumulator.
+static void pack_router_vnni(const float* src, uint8_t* dst, float* dst_scale,
+                             int rows, int cols) {
+    assert(rows % 16 == 0);
+    assert(cols % 4 == 0);
+    for (int r = 0; r < rows; r += 16) {
+        float amax[16] = {};
+        for (int i = 0; i < 16; ++i) {
+            float a = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                const float v = src[static_cast<size_t>(r + i) * cols + c];
+                const float av = v < 0.0f ? -v : v;
+                if (av > a) a = av;
+            }
+            amax[i] = a;
+            dst_scale[r + i] = a > 0.0f ? a / 127.0f : 1.0f;
+        }
+        for (int c = 0; c < cols; c += 4) {
+            uint8_t* const packed = dst + static_cast<size_t>(r) * cols +
+                                    static_cast<size_t>(c) * 16;
+            for (int i = 0; i < 16; ++i) {
+                const float inv = amax[i] > 0.0f ? 127.0f / amax[i] : 1.0f;
+                for (int j = 0; j < 4; ++j) {
+                    int q = lrintf(src[static_cast<size_t>(r + i) * cols + c + j] * inv);
+                    if (q > 127) q = 127;
+                    if (q < -127) q = -127;
+                    packed[i * 4 + j] = static_cast<uint8_t>(q + 128);
+                }
+            }
+        }
+    }
+}
 #if USE_AMX
 
 struct alignas(64) amx_tilecfg {
@@ -318,6 +376,158 @@ static void shared_expert_amx_batch(const float* __restrict x,
 
 #endif  // USE_AMX
 
+// Intra-FFN stage 1: compute the gate/up projection + SwiGLU activation for
+// one 16-wide block of f indices [f0, f0+16) of a single (token, slot) task.
+// Writes h[t,slot,f0:f0+16] and a local amax that the caller reduces across
+// all f-blocks of the task to get the global h_amax for requantization.
+//
+// Mirrors the inner body of expert_ffn's gate/up loop: VNNI dpbusd on 4-K
+// groups with 4-way unroll, then SiLU(h_gate * scale) * h_up * scale.
+static inline void expert_ffn_gateup_block(
+    const uint8_t* __restrict w_gate,
+    const uint8_t* __restrict w_up,
+    float s_gate, float s_up,
+    const int8_t* __restrict xq, float s_x, int32_t x_sum,
+    int d_model, int d_ff,
+    int f0, float* __restrict h_out, float* __restrict amax_out) {
+    const __m512i x_correction = _mm512_set1_epi32(-128 * x_sum);
+    const __m512 gate_scale = _mm512_set1_ps(s_x * s_gate);
+    const __m512 up_scale = _mm512_set1_ps(s_x * s_up);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 one = _mm512_set1_ps(1.0f);
+
+    __m512i gate_acc = x_correction;
+    __m512i up_acc = x_correction;
+    const size_t f_offset = static_cast<size_t>(f0) * d_model;
+    const int k_groups = d_model / 4;
+    int k = 0;
+    for (; k + 3 < k_groups; k += 4) {
+        uint32_t x4[4];
+        std::memcpy(x4, xq + k * 4, sizeof(x4));
+        const __m512i xa = _mm512_set1_epi32(static_cast<int32_t>(x4[0]));
+        const __m512i xb = _mm512_set1_epi32(static_cast<int32_t>(x4[1]));
+        const __m512i xc = _mm512_set1_epi32(static_cast<int32_t>(x4[2]));
+        const __m512i xd = _mm512_set1_epi32(static_cast<int32_t>(x4[3]));
+        const size_t o0 = static_cast<size_t>(k) * 64;
+        const size_t o1 = static_cast<size_t>(k + 1) * 64;
+        const size_t o2 = static_cast<size_t>(k + 2) * 64;
+        const size_t o3 = static_cast<size_t>(k + 3) * 64;
+        const __m512i wg0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o0));
+        const __m512i wg1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o1));
+        const __m512i wg2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o2));
+        const __m512i wg3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o3));
+        const __m512i wu0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o0));
+        const __m512i wu1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o1));
+        const __m512i wu2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o2));
+        const __m512i wu3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o3));
+        gate_acc = _mm512_dpbusd_epi32(gate_acc, wg0, xa);
+        up_acc   = _mm512_dpbusd_epi32(up_acc,   wu0, xa);
+        gate_acc = _mm512_dpbusd_epi32(gate_acc, wg1, xb);
+        up_acc   = _mm512_dpbusd_epi32(up_acc,   wu1, xb);
+        gate_acc = _mm512_dpbusd_epi32(gate_acc, wg2, xc);
+        up_acc   = _mm512_dpbusd_epi32(up_acc,   wu2, xc);
+        gate_acc = _mm512_dpbusd_epi32(gate_acc, wg3, xd);
+        up_acc   = _mm512_dpbusd_epi32(up_acc,   wu3, xd);
+    }
+    for (; k < k_groups; ++k) {
+        uint32_t x4;
+        std::memcpy(&x4, xq + k * 4, sizeof(x4));
+        const __m512i x4_i32 = _mm512_set1_epi32(static_cast<int32_t>(x4));
+        const size_t k4_offset = static_cast<size_t>(k) * 64;
+        const __m512i wg = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(w_gate + f_offset + k4_offset));
+        const __m512i wu = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(w_up + f_offset + k4_offset));
+        gate_acc = _mm512_dpbusd_epi32(gate_acc, wg, x4_i32);
+        up_acc   = _mm512_dpbusd_epi32(up_acc,   wu, x4_i32);
+    }
+    const __m512 vg = _mm512_mul_ps(gate_scale, _mm512_cvtepi32_ps(gate_acc));
+    const __m512 vu = _mm512_mul_ps(up_scale, _mm512_cvtepi32_ps(up_acc));
+    const __m512 silu = _mm512_div_ps(
+        vg, _mm512_add_ps(one, exp512_approx_ps(_mm512_sub_ps(zero, vg))));
+    const __m512 h_vec = _mm512_mul_ps(silu, vu);
+    _mm512_storeu_ps(h_out, h_vec);
+    *amax_out = _mm512_reduce_max_ps(_mm512_abs_ps(h_vec));
+    (void)d_ff;
+}
+
+// Intra-FFN stage 3: compute the down projection for one 16-wide block of d
+// indices [d0, d0+16) of a single (token, slot) task.  Reads the already-
+// requantized hq[t,slot,*] and the per-task s_h/s_down.
+static inline void expert_ffn_down_block(
+    const uint8_t* __restrict w_down, float s_down,
+    const int8_t* __restrict hq, int32_t hq_sum, float s_h,
+    int d_model, int d_ff, int d0, float* __restrict out) {
+    const __m512i h_correction = _mm512_set1_epi32(-128 * hq_sum);
+    const __m512 down_scale = _mm512_set1_ps(s_h * s_down);
+    const int f_groups = d_ff / 4;
+    const size_t d_offset = static_cast<size_t>(d0) * d_ff;
+    __m512i acc = h_correction;
+    int g = 0;
+    for (; g + 3 < f_groups; g += 4) {
+        uint32_t hq4[4];
+        std::memcpy(hq4, hq + g * 4, sizeof(hq4));
+        const __m512i qa = _mm512_set1_epi32(static_cast<int32_t>(hq4[0]));
+        const __m512i qb = _mm512_set1_epi32(static_cast<int32_t>(hq4[1]));
+        const __m512i qc = _mm512_set1_epi32(static_cast<int32_t>(hq4[2]));
+        const __m512i qd = _mm512_set1_epi32(static_cast<int32_t>(hq4[3]));
+        const size_t o0 = static_cast<size_t>(g) * 64;
+        const size_t o1 = static_cast<size_t>(g + 1) * 64;
+        const size_t o2 = static_cast<size_t>(g + 2) * 64;
+        const size_t o3 = static_cast<size_t>(g + 3) * 64;
+        const __m512i w0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o0));
+        const __m512i w1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o1));
+        const __m512i w2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o2));
+        const __m512i w3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o3));
+        acc = _mm512_dpbusd_epi32(acc, w0, qa);
+        acc = _mm512_dpbusd_epi32(acc, w1, qb);
+        acc = _mm512_dpbusd_epi32(acc, w2, qc);
+        acc = _mm512_dpbusd_epi32(acc, w3, qd);
+    }
+    for (; g < f_groups; ++g) {
+        uint32_t hq4;
+        std::memcpy(&hq4, hq + g * 4, sizeof(hq4));
+        const __m512i hq4_i32 = _mm512_set1_epi32(static_cast<int32_t>(hq4));
+        const size_t f4_offset = static_cast<size_t>(g) * 64;
+        acc = _mm512_dpbusd_epi32(
+            acc,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + f4_offset)),
+            hq4_i32);
+    }
+    _mm512_storeu_ps(out, _mm512_mul_ps(_mm512_cvtepi32_ps(acc), down_scale));
+}
+
+// Intra-FFN stage 2 (serial per task): reduce the per-block amax values to a
+// global h_amax, compute s_h, then requantize the full h[t,slot,*] into hq.
+// Also computes hq_sum (needed by the down projection's correction term).
+static inline void expert_ffn_requant(
+    const float* __restrict fblock_amax, int n_fblocks,
+    const float* __restrict h, int8_t* __restrict hq,
+    float* __restrict s_h_out, int32_t* __restrict hq_sum_out) {
+    __m512 amax_vec = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n_fblocks; i += 16) {
+        amax_vec = _mm512_max_ps(amax_vec, _mm512_loadu_ps(fblock_amax + i));
+    }
+    float h_amax = _mm512_reduce_max_ps(amax_vec);
+    for (; i < n_fblocks; ++i) {
+        const float a = fblock_amax[i];
+        if (a > h_amax) h_amax = a;
+    }
+    const float s_h = h_amax > 0.0f ? h_amax / 127.0f : 1.0f;
+    *s_h_out = s_h;
+    const __m512 inv_s_h = _mm512_set1_ps(h_amax > 0.0f ? 127.0f / h_amax : 1.0f);
+    const int d_ff = n_fblocks * 16;
+    for (int f = 0; f < d_ff; f += 16) {
+        const __m512i h_i32 = _mm512_cvt_roundps_epi32(
+            _mm512_mul_ps(_mm512_loadu_ps(h + f), inv_s_h),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(hq + f),
+                         _mm512_cvtsepi32_epi8(h_i32));
+    }
+    *hq_sum_out = sum_int8(hq, d_ff);
+}
+
 static void expert_ffn(const uint8_t* __restrict w_gate,
                        const uint8_t* __restrict w_up,
                        const uint8_t* __restrict w_down,
@@ -455,6 +665,25 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
 
 void preprocess(MoEWeights& w) {
     g_router_padded_experts = (w.num_experts + 15) & ~15;
+    // Keep the fp32-transposed router for S1/S2/S3.  S4 uses this W8A8 VNNI
+    // representation only for coarse candidate generation, then rescoring
+    // exactly 16 candidates in fp32 before final Top-K.
+    const size_t router_vnni_size =
+        static_cast<size_t>(g_router_padded_experts) * w.d_model;
+    w_router_vnni = new uint8_t[router_vnni_size]();
+    s_router = new float[g_router_padded_experts]();
+    {
+        std::vector<float> padded(
+            static_cast<size_t>(g_router_padded_experts) * w.d_model, 0.0f);
+        for (int e = 0; e < w.num_experts; ++e) {
+            for (int d = 0; d < w.d_model; ++d) {
+                padded[static_cast<size_t>(e) * w.d_model + d] =
+                    w.w_router[static_cast<size_t>(e) * w.d_model + d];
+            }
+        }
+        pack_router_vnni(padded.data(), w_router_vnni, s_router,
+                         g_router_padded_experts, w.d_model);
+    }
     w_router_transpose = new float[static_cast<size_t>(g_router_padded_experts) * w.d_model]();
     for (int e = 0; e < w.num_experts; ++e) {
         const int block = e & ~15;
@@ -527,41 +756,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
         int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
 
-        // Router GEMV: for each 16-expert block, dot the token with the
-        // 16 expert rows.  w_router_transpose was laid out so that for a
-        // fixed dimension d, the 16 experts' weights are contiguous
-        // ([block][d*16 + lane]); the token's value at d must be broadcast
-        // to all 16 lanes, so we use the scalar broadcast form.
-        for (int e = 0; e < g_router_padded_experts; e += 16) {
-            __m512 acc = _mm512_setzero_ps();
-            const float* const router_block = w_router_transpose + static_cast<size_t>(e) * d_model;
-            for (int d = 0; d < d_model; ++d) {
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_block + static_cast<size_t>(d) * 16),
-                                      _mm512_set1_ps(xt[d]), acc);
-            }
-            const __m512 s = _mm512_div_ps(
-                _mm512_set1_ps(1.0f),
-                _mm512_add_ps(_mm512_set1_ps(1.0f),
-                              exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc))));
-            _mm512_storeu_ps(scores + e, s);
-        }
-
-        int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-        bool used[MAX_NUM_EXPERTS] = {};
-        float gate_sum = 0.0f;
-        for (int k = 0; k < top_k; ++k) {
-            int best = -1;
-            for (int e = 0; e < num_experts; ++e) {
-                if (!used[e] && (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
-                    best = e;
-                }
-            }
-            used[best] = true;
-            topk_idx[k] = best;
-            gate_sum += scores[best];
-        }
-        gate_sum_workspace[t] = gate_sum;
-
+        // Quantize before routing so the W8A8 coarse router can reuse xq.
+        // x_sum_workspace must remain populated for the accepted S2 intra-FFN
+        // gate/up VNNI correction term.
         __m512 x_amax_vec = _mm512_setzero_ps();
         for (int d = 0; d < d_model; d += 16) {
             x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
@@ -577,6 +774,162 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
                              _mm512_cvtsepi32_epi8(q));
         }
+        const int32_t x_sum = sum_int8(xq, d_model);
+        x_sum_workspace[t] = x_sum;
+
+        int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        float gate_sum = 0.0f;
+
+        // S1/S2/S3 use the tested fp32 router.  The W8A8 candidate path is
+        // intentionally restricted to the E=512 S4-like shape.
+        if (num_experts == MAX_NUM_EXPERTS) {
+            const int k_groups = d_model / 4;
+            const __m512i x_correction = _mm512_set1_epi32(-128 * x_sum);
+            for (int e = 0; e < g_router_padded_experts; e += 16) {
+                // VNNI treats the packed q+128 weights as unsigned.  Start
+                // with -128 * sum(xq) to recover the signed W8A8 dot product.
+                __m512i acc = x_correction;
+                const uint8_t* const router_block =
+                    w_router_vnni + static_cast<size_t>(e) * d_model;
+                for (int k = 0; k < k_groups; ++k) {
+                    uint32_t x4;
+                    std::memcpy(&x4, xq + k * 4, sizeof(x4));
+                    acc = _mm512_dpbusd_epi32(
+                        acc,
+                        _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
+                            router_block + static_cast<size_t>(k) * 64)),
+                        _mm512_set1_epi32(static_cast<int32_t>(x4)));
+                }
+                const __m512 acc_f = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(acc),
+                    _mm512_mul_ps(_mm512_set1_ps(s_x), _mm512_loadu_ps(s_router + e)));
+                const __m512 s = _mm512_div_ps(
+                    _mm512_set1_ps(1.0f),
+                    _mm512_add_ps(_mm512_set1_ps(1.0f),
+                                  exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc_f))));
+                _mm512_storeu_ps(scores + e, s);
+            }
+
+            // Stable coarse Top-M by W8A8 affinity+bias.  Keep the worst
+            // retained candidate at heap root: this replaces the O(E*M)
+            // insertion scan with O(E + R*log(M)), while retaining the exact
+            // same Top-M set and ascending-index tie rule.
+            constexpr int kCoarseCandidates = 16;
+            int candidates[kCoarseCandidates];
+            float candidate_biased[kCoarseCandidates];
+            auto coarse_better = [](float lhs_score, int lhs_expert,
+                                    float rhs_score, int rhs_expert) {
+                return lhs_score > rhs_score ||
+                    (lhs_score == rhs_score && lhs_expert < rhs_expert);
+            };
+            for (int i = 0; i < kCoarseCandidates; ++i) {
+                candidates[i] = i;
+                candidate_biased[i] = scores[i] + w.bias[i];
+            }
+            auto sift_worst_down = [&](int root) {
+                for (;;) {
+                    const int left = root * 2 + 1;
+                    if (left >= kCoarseCandidates) break;
+                    const int right = left + 1;
+                    int worst = root;
+                    if (coarse_better(candidate_biased[worst], candidates[worst],
+                                      candidate_biased[left], candidates[left])) {
+                        worst = left;
+                    }
+                    if (right < kCoarseCandidates &&
+                        coarse_better(candidate_biased[worst], candidates[worst],
+                                      candidate_biased[right], candidates[right])) {
+                        worst = right;
+                    }
+                    if (worst == root) break;
+                    std::swap(candidates[root], candidates[worst]);
+                    std::swap(candidate_biased[root], candidate_biased[worst]);
+                    root = worst;
+                }
+            };
+            for (int root = kCoarseCandidates / 2 - 1; root >= 0; --root) {
+                sift_worst_down(root);
+            }
+            for (int e = kCoarseCandidates; e < num_experts; ++e) {
+                const float biased = scores[e] + w.bias[e];
+                if (coarse_better(biased, e, candidate_biased[0], candidates[0])) {
+                    candidates[0] = e;
+                    candidate_biased[0] = biased;
+                    sift_worst_down(0);
+                }
+            }
+            constexpr int candidate_count = kCoarseCandidates;
+
+            // Rescore only the 16 candidates in fp32.  Replacing their score
+            // also makes selected gate values fp32, not quantized estimates.
+            for (int i = 0; i < candidate_count; ++i) {
+                const int e = candidates[i];
+                __m512 acc = _mm512_setzero_ps();
+                const float* const router_row =
+                    w.w_router + static_cast<size_t>(e) * d_model;
+                for (int d = 0; d < d_model; d += 16) {
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                          _mm512_loadu_ps(xt + d), acc);
+                }
+                const float logit = _mm512_reduce_add_ps(acc);
+                scores[e] = 1.0f / (1.0f + expf(-logit));
+            }
+
+            bool candidate_used[kCoarseCandidates] = {};
+            for (int k = 0; k < top_k; ++k) {
+                int best_i = -1;
+                for (int i = 0; i < candidate_count; ++i) {
+                    if (candidate_used[i]) continue;
+                    const int e = candidates[i];
+                    if (best_i < 0) {
+                        best_i = i;
+                        continue;
+                    }
+                    const int best_e = candidates[best_i];
+                    const float biased = scores[e] + w.bias[e];
+                    const float best_biased = scores[best_e] + w.bias[best_e];
+                    if (biased > best_biased ||
+                        (biased == best_biased && e < best_e)) {
+                        best_i = i;
+                    }
+                }
+                const int best = candidates[best_i];
+                candidate_used[best_i] = true;
+                topk_idx[k] = best;
+                gate_sum += scores[best];
+            }
+        } else {
+            // Existing fp32 router path retained for S1/S2/S3.
+            for (int e = 0; e < g_router_padded_experts; e += 16) {
+                __m512 acc = _mm512_setzero_ps();
+                const float* const router_block =
+                    w_router_transpose + static_cast<size_t>(e) * d_model;
+                for (int d = 0; d < d_model; ++d) {
+                    acc = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(router_block + static_cast<size_t>(d) * 16),
+                        _mm512_set1_ps(xt[d]), acc);
+                }
+                const __m512 s = _mm512_div_ps(
+                    _mm512_set1_ps(1.0f),
+                    _mm512_add_ps(_mm512_set1_ps(1.0f),
+                                  exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc))));
+                _mm512_storeu_ps(scores + e, s);
+            }
+            bool used[MAX_NUM_EXPERTS] = {};
+            for (int k = 0; k < top_k; ++k) {
+                int best = -1;
+                for (int e = 0; e < num_experts; ++e) {
+                    if (!used[e] &&
+                        (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
+                        best = e;
+                    }
+                }
+                used[best] = true;
+                topk_idx[k] = best;
+                gate_sum += scores[best];
+            }
+        }
+        gate_sum_workspace[t] = gate_sum;
     }
 
     // Stage 2 + 3: compute every (token, expert-slot) FFN in parallel, then
@@ -588,6 +941,130 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int slots = top_k + 1;  // slot 0 = shared, 1..K = routed
     const int total_tasks = num_tokens * slots;
 
+    // For small N (S1: N=1, 5 tasks; S2: N=1, 5 tasks), the (token, slot)
+    // task space cannot fill 16 threads.  Split each expert_ffn internally
+    // across threads: gate/up and down both iterate in 16-wide blocks over
+    // d_ff / d_model, giving 5*(d_ff/16 + d_model/16) fine-grained tasks.
+    // The two stages are separated by a barrier because requantization
+    // needs the global h_amax (a reduction across all f-blocks of a task).
+    //
+    // Threshold: when total_tasks is large enough to keep 16 threads busy
+    // on its own (S3: 640, S4: 3072), intra-FFN splitting only adds
+    // overhead and cache contention, so we keep the original 1-task-per-
+    // thread path.  The crossover is around 32 tasks (2 tokens × 16 threads
+    // gives ~16 f-blocks per thread at d_ff=128 — a useful grain count).
+    // S1 (d_model=256, d_ff=128) is too short for the two barriers to pay
+    // back their cost; S2's 1024-wide down projection is large enough to win.
+    const bool use_intra_ffn = (total_tasks <= 32) && (d_ff >= 64) && (d_model >= 512);
+    const int n_fblocks = d_ff / 16;
+    const int n_dblocks = d_model / 16;
+
+    if (use_intra_ffn) {
+        // Per-(token, slot) pointer helpers into the flat workspaces.
+        // slot_stride is in units of MAX_D_FF for h/hq and MAX_D_MODEL for out.
+        const int fblock_tasks = total_tasks * n_fblocks;
+        const int dblock_tasks = total_tasks * n_dblocks;
+
+        // Use a single persistent parallel region to amortize the OpenMP
+        // fork/join overhead across the three intra-FFN stages.  Each stage
+        // is an omp for with an implicit barrier between them (required by
+        // the data dependency: stage 2 reads h written by stage 1, and
+        // stage 3 reads hq written by stage 2).
+#pragma omp parallel num_threads(16)
+        {
+        // Stage 1: gate/up + SwiGLU, parallel over (task, f-block).
+#pragma omp for schedule(static)
+        for (int bt = 0; bt < fblock_tasks; ++bt) {
+            const int task = bt / n_fblocks;
+            const int f0 = (bt % n_fblocks) * 16;
+            const int t = task / slots;
+            const int slot = task % slots;
+            const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+            const float s_x = x_scale_workspace[t];
+            const int32_t x_sum = x_sum_workspace[t];
+            float* h = intra_h + static_cast<size_t>(t) * slots * MAX_D_FF +
+                              static_cast<size_t>(slot) * MAX_D_FF + f0;
+            float* amax_slot = intra_fblock_amax +
+                                static_cast<size_t>(t) * slots * (MAX_D_FF / 16) +
+                                static_cast<size_t>(slot) * (MAX_D_FF / 16);
+
+            const uint8_t* w_gate;
+            const uint8_t* w_up;
+            float s_gate, s_up;
+            if (slot == 0) {
+#if USE_AMX
+                w_gate = w_sh_gate_vnni; w_up = w_sh_up_vnni;
+#else
+                w_gate = w_sh_gate_transpose; w_up = w_sh_up_transpose;
+#endif
+                s_gate = w.sh_s_gate; s_up = w.sh_s_up;
+            } else {
+                const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+                const int e = topk_idx[slot - 1];
+                w_gate = w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model;
+                w_up   = w_up_transpose   + static_cast<size_t>(e) * d_ff * d_model;
+                s_gate = w.s_gate[e]; s_up = w.s_up[e];
+            }
+            expert_ffn_gateup_block(w_gate, w_up, s_gate, s_up,
+                                    xq, s_x, x_sum,
+                                    d_model, d_ff, f0,
+                                    h, &amax_slot[f0 / 16]);
+        }
+
+        // Stage 2: per-task reduce + requant (serial within a task, but
+        // tasks are independent so we parallelize across tasks).  Each task
+        // touches only its own h/hq/amax slice, so it's race-free.
+#pragma omp for schedule(static)
+        for (int task = 0; task < total_tasks; ++task) {
+            const int t = task / slots;
+            const int slot = task % slots;
+            const float* h = intra_h + static_cast<size_t>(t) * slots * MAX_D_FF +
+                              static_cast<size_t>(slot) * MAX_D_FF;
+            int8_t* hq = intra_hq + static_cast<size_t>(t) * slots * MAX_D_FF +
+                          static_cast<size_t>(slot) * MAX_D_FF;
+            const float* amax_slot = intra_fblock_amax +
+                                      static_cast<size_t>(t) * slots * (MAX_D_FF / 16) +
+                                      static_cast<size_t>(slot) * (MAX_D_FF / 16);
+            float* s_h_slot = intra_s_h + static_cast<size_t>(t) * slots + slot;
+            int32_t* hq_sum_slot = intra_hq_sum + static_cast<size_t>(t) * slots + slot;
+            expert_ffn_requant(amax_slot, n_fblocks, h, hq, s_h_slot, hq_sum_slot);
+        }
+
+        // Stage 3: down projection, parallel over (task, d-block).
+#pragma omp for schedule(static)
+        for (int bt = 0; bt < dblock_tasks; ++bt) {
+            const int task = bt / n_dblocks;
+            const int d0 = (bt % n_dblocks) * 16;
+            const int t = task / slots;
+            const int slot = task % slots;
+            const int8_t* hq = intra_hq + static_cast<size_t>(t) * slots * MAX_D_FF +
+                                static_cast<size_t>(slot) * MAX_D_FF;
+            const int32_t hq_sum = intra_hq_sum[static_cast<size_t>(t) * slots + slot];
+            const float s_h = intra_s_h[static_cast<size_t>(t) * slots + slot];
+            float* out = expert_out_workspace +
+                         static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                         static_cast<size_t>(slot) * MAX_D_MODEL + d0;
+
+            const uint8_t* w_down;
+            float s_down;
+            if (slot == 0) {
+#if USE_AMX
+                w_down = w_sh_down_vnni;
+#else
+                w_down = w_sh_down_transpose;
+#endif
+                s_down = w.sh_s_down;
+            } else {
+                const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+                const int e = topk_idx[slot - 1];
+                w_down = w_down_transpose + static_cast<size_t>(e) * d_model * d_ff;
+                s_down = w.s_down[e];
+            }
+            expert_ffn_down_block(w_down, s_down, hq, hq_sum, s_h,
+                                  d_model, d_ff, d0, out);
+        }
+        }  // end parallel region
+    } else {
     // The (token, slot) FFN loop's work per task is uniform, but its task
     // count varies wildly with N (5 for S1, 3072 for S4).  Cap the team size
     // so small-N cases don't pay OpenMP's per-thread overhead for threads
@@ -622,6 +1099,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                        w.s_gate[e], w.s_up[e], w.s_down[e], xq,
                        x_scale_workspace[t], out, d_model, d_ff);
         }
+    }
     }
 
     // Combine: y_t = x_t + 1*o_shared + sum_k gate_k * o_k.  Fused into a
