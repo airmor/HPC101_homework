@@ -49,6 +49,10 @@ float* w_router_transpose;
 // for VNNI.  The +128 encoding is corrected with the token xq sum in the
 // kernel, exactly as in the expert W8A8 projections.
 uint8_t* w_router_vnni;
+// AMX-tiled router weights for the S4 batched-GEMM path.  Layout matches
+// pack_amx_weights: [16 expert rows][64 K-byte cols] per tile, +128 encoding.
+// Only the router GEMV changes; s_router is shared with the VNNI path.
+uint8_t* w_router_amx;
 float* s_router;
 uint8_t* w_sh_gate_transpose;
 uint8_t* w_sh_up_transpose;
@@ -182,6 +186,49 @@ static void pack_router_vnni(const float* src, uint8_t* dst, float* dst_scale,
         }
     }
 }
+// Quantize fp32 router weights per expert row and pack them in the AMX tile
+// layout: [16 expert rows][64-byte K-tiles].  Reuses the SAME per-row amax and
+// scale (s_router) as pack_router_vnni so the AMX router path produces scores
+// numerically identical to the VNNI router path (both recover the signed int8
+// dot product via the +128 / -128*sum(xq) correction).  cols must be a
+// multiple of 64 (the AMX tile width); d_model=512 satisfies this for S4.
+static void pack_router_amx(const float* src, uint8_t* dst, const float* src_scale,
+                            int rows, int cols) {
+#if USE_AMX
+    assert(rows % 16 == 0);
+    assert(cols % 64 == 0);
+    for (int r = 0; r < rows; r += 16) {
+        float amax[16] = {};
+        for (int i = 0; i < 16; ++i) {
+            float a = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                const float v = src[static_cast<size_t>(r + i) * cols + c];
+                const float av = v < 0.0f ? -v : v;
+                if (av > a) a = av;
+            }
+            amax[i] = a;
+            // s_router is shared with the VNNI path; verify consistency.
+            const float expect = a > 0.0f ? a / 127.0f : 1.0f;
+            (void)expect; (void)src_scale;
+        }
+        for (int k0 = 0; k0 < cols; k0 += 64) {
+            uint8_t* tile = dst + static_cast<size_t>(r) * cols +
+                            static_cast<size_t>(k0) * 16;
+            for (int i = 0; i < 16; ++i) {
+                const float inv = amax[i] > 0.0f ? 127.0f / amax[i] : 1.0f;
+                for (int k = 0; k < 64; ++k) {
+                    int q = lrintf(src[static_cast<size_t>(r + i) * cols + k0 + k] * inv);
+                    if (q > 127) q = 127;
+                    if (q < -127) q = -127;
+                    tile[i * 64 + k] = static_cast<uint8_t>(q + 128);
+                }
+            }
+        }
+    }
+#else
+    (void)src; (void)dst; (void)src_scale; (void)rows; (void)cols;
+#endif
+}
 #if USE_AMX
 
 struct alignas(64) amx_tilecfg {
@@ -203,6 +250,124 @@ static inline void load_amx_shared_config(int tokens_in_block) {
     cfg.rows[4] = 16;
     cfg.colsb[4] = static_cast<uint16_t>(tokens_in_block * 4);
     _tile_loadconfig(&cfg);
+}
+
+// AMX tile configuration for the batched router GEMM.  C[M,N] += A[M,K]*B[K,N]
+// where M=16 experts, N=tokens_in_block, K=d_model (in groups of 64).
+//   tile 0 = C (16 experts x tokens, 4 bytes per token cell)
+//   tile 2 = B = router weights (16 rows x 64 K-cols, byte)
+//   tile 4 = A = packed token activations (16 K-rows x tokens*4, byte)
+// The token activation tile rows step through d_model in chunks of 64
+// (each K-row holds 64 bytes); rows fixed at 16 so the tile spans 1024 K bytes.
+static inline void load_amx_router_config(int tokens_in_block) {
+    assert(tokens_in_block >= 1 && tokens_in_block <= 16);
+    amx_tilecfg cfg{};
+    cfg.palette_id = 1;
+    cfg.rows[0] = 16;
+    cfg.colsb[0] = static_cast<uint16_t>(tokens_in_block * 4);
+    cfg.rows[2] = 16;
+    cfg.colsb[2] = 64;
+    cfg.rows[4] = 16;
+    cfg.colsb[4] = static_cast<uint16_t>(tokens_in_block * 4);
+    _tile_loadconfig(&cfg);
+}
+#else
+
+struct amx_tilecfg;
+static inline void load_amx_shared_config(int) {}
+static inline void load_amx_router_config(int) {}
+#endif  // USE_AMX (tilecfg helpers)
+
+// Batched router GEMM for the S4 large-N path.  Computes coarse W8A8 router
+// scores for a 16-token block: score[expert][token] = sum_k w[expert][k] *
+// xq[token][k], using AMX _tile_dpbusd to process 16 experts x up to 16 tokens
+// x 64 K-bytes per tile.  Mirrors shared_expert_amx_batch's packing and
+// +128-correction handling so the int8 dot product is recovered exactly.
+//
+// Output is written to `scores` at the same layout the VNNI router path uses:
+// scores[t * MAX_NUM_EXPERTS + e] (token-major, padded-experts stride), so the
+// downstream Top-M heap and FP32 rescore need no changes.
+//
+// xq_total uses the MAX_D_MODEL-per-token stride fixed by the quantization
+// stage (see the shared_expert_amx_batch comment for the original stride bug).
+static void router_amx_batch(const int8_t* __restrict xq_total,
+                             const float* __restrict s_x_total,
+                             const int32_t* __restrict x_sum_total,
+                             const uint8_t* __restrict w_router,
+                             const float* __restrict s_router_w,
+                             float* __restrict scores,
+                             int block_begin, int B,
+                             int d_model, int num_experts,
+                             int padded_experts) {
+#if USE_AMX
+    // x_tile layout: for each 4-K group, B tokens' 4 bytes contiguously, then
+    // 16 K-rows of 64 bytes each tile-load.  Matches pack_token_amx_b but
+    // reused here with the explicit stride for clarity.
+    alignas(64) int8_t x_tile[(MAX_D_MODEL / 4) * 16 * 4];
+    alignas(64) int32_t acc_tile[16 * 16];
+    int32_t x_sum[16] = {};
+
+    for (int b = 0; b < B; ++b) {
+        x_sum[b] = x_sum_total[block_begin + b];
+    }
+    for (int k0 = 0; k0 < d_model; k0 += 64) {
+        int8_t* const dst_block = x_tile + static_cast<size_t>(k0 / 4) * B * 4;
+        for (int k4 = 0; k4 < 16; ++k4) {
+            int8_t* const dst_row = dst_block + static_cast<size_t>(k4) * B * 4;
+            for (int b = 0; b < B; ++b) {
+                const int8_t* src = xq_total +
+                    static_cast<size_t>(block_begin + b) * MAX_D_MODEL + k0 + k4 * 4;
+                std::memcpy(dst_row + b * 4, src, 4);
+            }
+        }
+    }
+
+    load_amx_router_config(B);
+    for (int e = 0; e < padded_experts; e += 16) {
+        _tile_zero(0);
+        for (int k0 = 0; k0 < d_model; k0 += 64) {
+            // B tile: 16 expert rows x 64 K-bytes, laid out by pack_amx_weights
+            // as dst[e * d_model + k0 * 16][i*64 + k].
+            _tile_loadd(2,
+                w_router + static_cast<size_t>(e) * d_model +
+                    static_cast<size_t>(k0) * 16, 64);
+            _tile_loadd(4,
+                x_tile + static_cast<size_t>(k0 / 4) * B * 4, B * 4);
+            _tile_dpbusd(0, 2, 4);
+        }
+        _tile_stored(0, acc_tile, B * 4);
+
+        // Dequantize: int score = acc - 128 * x_sum; fp32 logit =
+        // (s_x * s_router_e) * int_score; sigmoid.  Padded trailing experts have
+        // zero weights (pack_router_vnni zero-pads), so their scores are 0.5
+        // sigmoid of the x_correction term — these never enter top-K because
+        // num_experts bounds the Top-M heap scan.
+        for (int i = 0; i < 16; ++i) {
+            const int expert = e + i;
+            alignas(64) float logits[16] = {};
+            for (int b = 0; b < B; ++b) {
+                const int32_t corrected = acc_tile[i * B + b] - 128 * x_sum[b];
+                const float sc = s_x_total[block_begin + b] * s_router_w[expert];
+                logits[b] = static_cast<float>(corrected) * sc;
+            }
+            const __m512 acc_f = _mm512_load_ps(logits);
+            const __m512 s = _mm512_div_ps(
+                _mm512_set1_ps(1.0f),
+                _mm512_add_ps(_mm512_set1_ps(1.0f),
+                              exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc_f))));
+            alignas(64) float svals[16];
+            _mm512_store_ps(svals, s);
+            for (int b = 0; b < B; ++b) {
+                scores[static_cast<size_t>(block_begin + b) * MAX_NUM_EXPERTS + expert] = svals[b];
+            }
+        }
+    }
+    _tile_release();
+#else
+    (void)xq_total; (void)s_x_total; (void)x_sum_total; (void)w_router;
+    (void)s_router_w; (void)scores; (void)block_begin; (void)B;
+    (void)d_model; (void)num_experts; (void)padded_experts;
+#endif
 }
 
 // Pack a single token's int8 activation into AMX's expected layout for the
@@ -373,8 +538,6 @@ static void shared_expert_amx_batch(const float* __restrict x,
     }
     _tile_release();
 }
-
-#endif  // USE_AMX
 
 // Intra-FFN stage 1: compute the gate/up projection + SwiGLU activation for
 // one 16-wide block of f indices [f0, f0+16) of a single (token, slot) task.
@@ -683,6 +846,19 @@ void preprocess(MoEWeights& w) {
         }
         pack_router_vnni(padded.data(), w_router_vnni, s_router,
                          g_router_padded_experts, w.d_model);
+#if USE_AMX
+        // AMX-tiled router weights for the S4 batched-GEMM path.  d_model must
+        // be a multiple of 64 for the 64-byte tile width; S4 (d_model=512)
+        // satisfies this.  s_router is shared with the VNNI path (pack_router_amx
+        // uses the same per-row amax/scale).
+        if (w.d_model % 64 == 0) {
+            const size_t router_amx_size =
+                static_cast<size_t>(g_router_padded_experts) * w.d_model;
+            w_router_amx = new uint8_t[router_amx_size]();
+            pack_router_amx(padded.data(), w_router_amx, s_router,
+                            g_router_padded_experts, w.d_model);
+        }
+#endif
     }
     w_router_transpose = new float[static_cast<size_t>(g_router_padded_experts) * w.d_model]();
     for (int e = 0; e < w.num_experts; ++e) {
@@ -745,6 +921,163 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int num_experts = w.num_experts;
     const int top_k = w.top_k;
 
+    // IDEA-20260727-009: AMX batched router GEMM for S4 (large-N, E=512).
+    // The per-token VNNI router (one GEMV per token over 512 experts) is the
+    // S4 top hotspot (~33% CPU, VTune job 11254).  When N is large enough to
+    // fill a 16-token AMX tile AND d_model is a multiple of 64 (the AMX tile
+    // width), replace the per-token VNNI GEMV with a 16-token batched AMX GEMM
+    // that computes 16 experts x 16 tokens per _tile_dpbusd.  S1/S2 (N=1) and
+    // non-AMX builds keep the original per-token path (a single token wastes
+    // 15/16 of an AMX tile, same reasoning as the small-N FFN path).
+#if USE_AMX && defined(__linux__)
+    const bool use_amx_router =
+        (num_experts == MAX_NUM_EXPERTS) &&
+        (num_tokens >= 16) &&
+        (d_model % 64 == 0) &&
+        (w_router_amx != nullptr);
+#else
+    const bool use_amx_router = false;
+#endif
+    if (use_amx_router) {
+        // Quantize all tokens first (xq / s_x / x_sum), then run the batched
+        // AMX router GEMM, then per-token Top-M + FP32 rescore + Top-K.  The
+        // quantization loop mirrors the per-token block below so xq_workspace,
+        // x_scale_workspace and x_sum_workspace are populated identically.
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+        for (int t = 0; t < num_tokens; ++t) {
+            const float* const xt = x + static_cast<size_t>(t) * d_model;
+            int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+            __m512 x_amax_vec = _mm512_setzero_ps();            for (int d = 0; d < d_model; d += 16) {
+                x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
+            }
+            const float x_amax = _mm512_reduce_max_ps(x_amax_vec);
+            const float s_x = x_amax > 0.0f ? x_amax / 127.0f : 1.0f;
+            x_scale_workspace[t] = s_x;
+            const __m512 inv_s_x = _mm512_set1_ps(x_amax > 0.0f ? 127.0f / x_amax : 1.0f);
+            for (int d = 0; d < d_model; d += 16) {
+                const __m512i q = _mm512_cvt_roundps_epi32(
+                    _mm512_mul_ps(_mm512_loadu_ps(xt + d), inv_s_x),
+                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
+                                 _mm512_cvtsepi32_epi8(q));
+            }
+            x_sum_workspace[t] = sum_int8(xq, d_model);
+        }
+
+        // Batched AMX router GEMM over 16-token blocks.  Each block writes
+        // coarse scores into score_workspace[t][e] for e in [0, padded_experts).
+        // Parallelized across blocks: AMX tile registers and the tile config
+        // are per-thread state, and each block writes a distinct set of token
+        // rows in score_workspace, so there are no races.  The win over the
+        // per-token VNNI path is compute density (16 experts x 16 tokens per
+        // _tile_dpbusd) AND retaining the 16-thread parallelism.
+        const int num_blocks = (num_tokens + 15) / 16;
+#pragma omp parallel for if (num_blocks >= 2) schedule(static)
+        for (int blk = 0; blk < num_blocks; ++blk) {
+            const int block_begin = blk * 16;
+            const int B = (num_tokens - block_begin < 16) ? (num_tokens - block_begin) : 16;
+            router_amx_batch(xq_workspace, x_scale_workspace, x_sum_workspace,
+                            w_router_amx, s_router, score_workspace,
+                            block_begin, B, d_model, num_experts,
+                            g_router_padded_experts);
+        }
+
+        // Per-token Top-M heap + FP32 rescore + Top-K, parallel across tokens.
+        // Identical to the VNNI router's post-GEMV stage so Top-K selection
+        // semantics (stable worst-root heap, ascending-index tie, fp32 rescore)
+        // are unchanged — only the score computation differs.
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+        for (int t = 0; t < num_tokens; ++t) {
+            const float* const xt = x + static_cast<size_t>(t) * d_model;
+            float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+            int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+            float gate_sum = 0.0f;
+
+            constexpr int kCoarseCandidates = 16;
+            int candidates[kCoarseCandidates];
+            float candidate_biased[kCoarseCandidates];
+            auto coarse_better = [](float lhs_score, int lhs_expert,
+                                    float rhs_score, int rhs_expert) {
+                return lhs_score > rhs_score ||
+                    (lhs_score == rhs_score && lhs_expert < rhs_expert);
+            };
+            for (int i = 0; i < kCoarseCandidates; ++i) {
+                candidates[i] = i;
+                candidate_biased[i] = scores[i] + w.bias[i];
+            }
+            auto sift_worst_down = [&](int root) {
+                for (;;) {
+                    const int left = root * 2 + 1;
+                    if (left >= kCoarseCandidates) break;
+                    const int right = left + 1;
+                    int worst = root;
+                    if (coarse_better(candidate_biased[worst], candidates[worst],
+                                      candidate_biased[left], candidates[left])) {
+                        worst = left;
+                    }
+                    if (right < kCoarseCandidates &&
+                        coarse_better(candidate_biased[worst], candidates[worst],
+                                      candidate_biased[right], candidates[right])) {
+                        worst = right;
+                    }
+                    if (worst == root) break;
+                    std::swap(candidates[root], candidates[worst]);
+                    std::swap(candidate_biased[root], candidate_biased[worst]);
+                    root = worst;
+                }
+            };
+            for (int root = kCoarseCandidates / 2 - 1; root >= 0; --root) {
+                sift_worst_down(root);
+            }
+            for (int e = kCoarseCandidates; e < num_experts; ++e) {
+                const float biased = scores[e] + w.bias[e];
+                if (coarse_better(biased, e, candidate_biased[0], candidates[0])) {
+                    candidates[0] = e;
+                    candidate_biased[0] = biased;
+                    sift_worst_down(0);
+                }
+            }
+            constexpr int candidate_count = kCoarseCandidates;
+
+            for (int i = 0; i < candidate_count; ++i) {
+                const int e = candidates[i];
+                __m512 acc = _mm512_setzero_ps();
+                const float* const router_row =
+                    w.w_router + static_cast<size_t>(e) * d_model;
+                for (int d = 0; d < d_model; d += 16) {
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                          _mm512_loadu_ps(xt + d), acc);
+                }
+                const float logit = _mm512_reduce_add_ps(acc);
+                scores[e] = 1.0f / (1.0f + expf(-logit));
+            }
+
+            bool candidate_used[kCoarseCandidates] = {};
+            for (int k = 0; k < top_k; ++k) {
+                int best_i = -1;
+                for (int i = 0; i < candidate_count; ++i) {
+                    if (candidate_used[i]) continue;
+                    const int e = candidates[i];
+                    if (best_i < 0) {
+                        best_i = i;
+                        continue;
+                    }
+                    const int best_e = candidates[best_i];
+                    const float biased = scores[e] + w.bias[e];
+                    const float best_biased = scores[best_e] + w.bias[best_e];
+                    if (biased > best_biased ||
+                        (biased == best_biased && e < best_e)) {
+                        best_i = i;
+                    }
+                }
+                const int best = candidates[best_i];
+                candidate_used[best_i] = true;
+                topk_idx[k] = best;
+                gate_sum += scores[best];
+            }
+            gate_sum_workspace[t] = gate_sum;
+        }
+    } else {
     // Stage 1: router, Top-K metadata, and quantization.  All output arrays
     // are indexed by token, hence this is race-free and allocation-free.
     // For tiny N (S1/S2: one token) the router and top-K are pure overhead
@@ -931,6 +1264,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         }
         gate_sum_workspace[t] = gate_sum;
     }
+    }  // end of non-AMX-router Stage 1
 
     // Stage 2 + 3: compute every (token, expert-slot) FFN in parallel, then
     // combine.  We organize the (token, slot) task space so adjacent tasks
