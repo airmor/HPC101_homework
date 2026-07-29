@@ -87,6 +87,25 @@ alignas(64) static float expert_out_workspace[MAX_NUM_TOKENS *
 // of a token because xq is per-token.
 alignas(64) static int32_t x_sum_workspace[MAX_NUM_TOKENS];
 
+// Batched expert FFN: process B tokens of the SAME expert in one call so
+// each weight ZMM is loaded once and reused across the inner B-token loop.
+// Static workspace (NOT stack) so the large h/hq buffers do not bloat the
+// stack frame of moe_forward_optimized — round-004 showed stack bloat from
+// per-call alignas(64) arrays caused a catastrophic S2 binary-level
+// regression (+11472%) via GCC stack-frame rearrangement of the intra-FFN
+// path.  Using file-scope statics keeps each thread's frame small.
+constexpr int EXPERT_FFN_BATCH_B_MAX = 8;
+
+// Count-sort + flat-batch workspaces for the batched-FFN dispatch path.
+alignas(64) static int expert_token_count[MAX_NUM_EXPERTS + 2];
+alignas(64) static int expert_token_offset[MAX_NUM_EXPERTS + 2];
+alignas(64) static int sorted_token_ids[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int sorted_slot_ids[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int batch_expert_id[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int batch_B[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int batch_token_start[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+alignas(64) static int batch_is_shared[MAX_NUM_TOKENS * (MAX_TOP_K + 1)];
+
 // Intra-FFN workspaces: when N is tiny (S1/S2: one token, 5 (token,slot)
 // tasks), the (token, slot) task space is too small to fill 16 threads.  We
 // split each expert_ffn internally across threads — gate/up by 16-wide
@@ -689,6 +708,183 @@ static inline void expert_ffn_requant(
                          _mm512_cvtsepi32_epi8(h_i32));
     }
     *hq_sum_out = sum_int8(hq, d_ff);
+}
+
+// Batched expert FFN: process B tokens of the SAME expert in one call.
+// Weights are loaded into ZMMs once per K-group and reused across the inner
+// B-token loop, cutting weight load traffic by ~Bx for the batched tokens.
+// This is the mechanism validated in round-004 (S4 -40.43%); the S2 +11472%
+// regression there was a binary-level side effect.  Here the function is
+// marked noinline+cold so its ~330 lines of intrinsics and 8KB stack frame
+// are placed at the far end of the code segment, isolating the per-task and
+// intra-FFN paths (S1/S2/S3) from icache pressure and code-layout shifts.
+// h/hq are stack-local so each thread gets its own copy (no race).
+__attribute__((noinline, cold))
+static void expert_ffn_batch(
+    const uint8_t* __restrict w_gate,
+    const uint8_t* __restrict w_up,
+    const uint8_t* __restrict w_down,
+    float s_gate, float s_up, float s_down,
+    const int8_t* __restrict xq_list[EXPERT_FFN_BATCH_B_MAX],
+    const float* __restrict s_x_list,
+    const int32_t* __restrict x_sum_list,
+    float* __restrict out_list[EXPERT_FFN_BATCH_B_MAX],
+    int B, int d_model, int d_ff) {
+
+    alignas(64) float h[EXPERT_FFN_BATCH_B_MAX][MAX_D_FF];
+    alignas(64) int8_t hq[EXPERT_FFN_BATCH_B_MAX][MAX_D_FF];
+    float h_amax[EXPERT_FFN_BATCH_B_MAX] = {};
+    float s_h[EXPERT_FFN_BATCH_B_MAX];
+    int32_t hq_sum[EXPERT_FFN_BATCH_B_MAX] = {};
+
+    const int k_groups = d_model / 4;
+
+    // Stage 1: gate/up + SwiGLU, batched across B tokens per f-block.
+    for (int f = 0; f < d_ff; f += 16) {
+        const size_t f_offset = static_cast<size_t>(f) * d_model;
+
+        __m512i gate_acc[EXPERT_FFN_BATCH_B_MAX];
+        __m512i up_acc[EXPERT_FFN_BATCH_B_MAX];
+        for (int b = 0; b < B; ++b) {
+            gate_acc[b] = _mm512_set1_epi32(-128 * x_sum_list[b]);
+            up_acc[b]   = _mm512_set1_epi32(-128 * x_sum_list[b]);
+        }
+
+        int k = 0;
+        for (; k + 3 < k_groups; k += 4) {
+            const size_t o0 = static_cast<size_t>(k) * 64;
+            const size_t o1 = static_cast<size_t>(k + 1) * 64;
+            const size_t o2 = static_cast<size_t>(k + 2) * 64;
+            const size_t o3 = static_cast<size_t>(k + 3) * 64;
+
+            const __m512i wg0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o0));
+            const __m512i wg1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o1));
+            const __m512i wg2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o2));
+            const __m512i wg3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + o3));
+            const __m512i wu0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o0));
+            const __m512i wu1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o1));
+            const __m512i wu2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o2));
+            const __m512i wu3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o3));
+
+            for (int b = 0; b < B; ++b) {
+                uint32_t x4[4];
+                std::memcpy(x4, xq_list[b] + k * 4, sizeof(x4));
+                const __m512i xa = _mm512_set1_epi32(static_cast<int32_t>(x4[0]));
+                const __m512i xb = _mm512_set1_epi32(static_cast<int32_t>(x4[1]));
+                const __m512i xc = _mm512_set1_epi32(static_cast<int32_t>(x4[2]));
+                const __m512i xd = _mm512_set1_epi32(static_cast<int32_t>(x4[3]));
+                gate_acc[b] = _mm512_dpbusd_epi32(gate_acc[b], wg0, xa);
+                up_acc[b]   = _mm512_dpbusd_epi32(up_acc[b],   wu0, xa);
+                gate_acc[b] = _mm512_dpbusd_epi32(gate_acc[b], wg1, xb);
+                up_acc[b]   = _mm512_dpbusd_epi32(up_acc[b],   wu1, xb);
+                gate_acc[b] = _mm512_dpbusd_epi32(gate_acc[b], wg2, xc);
+                up_acc[b]   = _mm512_dpbusd_epi32(up_acc[b],   wu2, xc);
+                gate_acc[b] = _mm512_dpbusd_epi32(gate_acc[b], wg3, xd);
+                up_acc[b]   = _mm512_dpbusd_epi32(up_acc[b],   wu3, xd);
+            }
+        }
+        for (; k < k_groups; ++k) {
+            const size_t k4_offset = static_cast<size_t>(k) * 64;
+            const __m512i wg = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_gate + f_offset + k4_offset));
+            const __m512i wu = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + k4_offset));
+            for (int b = 0; b < B; ++b) {
+                uint32_t x4;
+                std::memcpy(&x4, xq_list[b] + k * 4, sizeof(x4));
+                const __m512i x4_i32 = _mm512_set1_epi32(static_cast<int32_t>(x4));
+                gate_acc[b] = _mm512_dpbusd_epi32(gate_acc[b], wg, x4_i32);
+                up_acc[b]   = _mm512_dpbusd_epi32(up_acc[b],   wu, x4_i32);
+            }
+        }
+
+        const __m512 zero = _mm512_setzero_ps();
+        const __m512 one = _mm512_set1_ps(1.0f);
+        for (int b = 0; b < B; ++b) {
+            const __m512 gate_scale = _mm512_set1_ps(s_x_list[b] * s_gate);
+            const __m512 up_scale = _mm512_set1_ps(s_x_list[b] * s_up);
+            const __m512 vg = _mm512_mul_ps(gate_scale, _mm512_cvtepi32_ps(gate_acc[b]));
+            const __m512 vu = _mm512_mul_ps(up_scale, _mm512_cvtepi32_ps(up_acc[b]));
+            const __m512 silu = _mm512_div_ps(
+                vg, _mm512_add_ps(one, exp512_approx_ps(_mm512_sub_ps(zero, vg))));
+            const __m512 h_vec = _mm512_mul_ps(silu, vu);
+            _mm512_storeu_ps(&h[b][f], h_vec);
+            const __m512 abs_h = _mm512_abs_ps(h_vec);
+            const float block_amax = _mm512_reduce_max_ps(abs_h);
+            if (block_amax > h_amax[b]) h_amax[b] = block_amax;
+        }
+    }
+
+    // Stage 2: per-token requant (independent across B).
+    for (int b = 0; b < B; ++b) {
+        __m512 amax_vec = _mm512_setzero_ps();
+        for (int f = 0; f < d_ff; f += 16) {
+            amax_vec = _mm512_max_ps(amax_vec, _mm512_abs_ps(_mm512_loadu_ps(&h[b][f])));
+        }
+        const float full_amax = _mm512_reduce_max_ps(amax_vec);
+        h_amax[b] = full_amax;
+        const float inv_s_h = full_amax > 0.0f ? 127.0f / full_amax : 1.0f;
+        s_h[b] = full_amax > 0.0f ? full_amax / 127.0f : 1.0f;
+        const __m512 inv = _mm512_set1_ps(inv_s_h);
+        for (int f = 0; f < d_ff; f += 16) {
+            const __m512i h_i32 = _mm512_cvt_roundps_epi32(
+                _mm512_mul_ps(_mm512_loadu_ps(&h[b][f]), inv),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(&hq[b][f]),
+                             _mm512_cvtsepi32_epi8(h_i32));
+        }
+        hq_sum[b] = sum_int8(&hq[b][0], d_ff);
+    }
+
+    // Stage 3: down projection, batched across B tokens per d-block.
+    const int f_groups = d_ff / 4;
+    for (int d = 0; d < d_model; d += 16) {
+        const size_t d_offset = static_cast<size_t>(d) * d_ff;
+
+        __m512i acc[EXPERT_FFN_BATCH_B_MAX];
+        for (int b = 0; b < B; ++b) {
+            acc[b] = _mm512_set1_epi32(-128 * hq_sum[b]);
+        }
+
+        int g = 0;
+        for (; g + 3 < f_groups; g += 4) {
+            const size_t o0 = static_cast<size_t>(g) * 64;
+            const size_t o1 = static_cast<size_t>(g + 1) * 64;
+            const size_t o2 = static_cast<size_t>(g + 2) * 64;
+            const size_t o3 = static_cast<size_t>(g + 3) * 64;
+            const __m512i w0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o0));
+            const __m512i w1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o1));
+            const __m512i w2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o2));
+            const __m512i w3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o3));
+
+            for (int b = 0; b < B; ++b) {
+                uint32_t hq4[4];
+                std::memcpy(hq4, &hq[b][g * 4], sizeof(hq4));
+                const __m512i qa = _mm512_set1_epi32(static_cast<int32_t>(hq4[0]));
+                const __m512i qb = _mm512_set1_epi32(static_cast<int32_t>(hq4[1]));
+                const __m512i qc = _mm512_set1_epi32(static_cast<int32_t>(hq4[2]));
+                const __m512i qd = _mm512_set1_epi32(static_cast<int32_t>(hq4[3]));
+                acc[b] = _mm512_dpbusd_epi32(acc[b], w0, qa);
+                acc[b] = _mm512_dpbusd_epi32(acc[b], w1, qb);
+                acc[b] = _mm512_dpbusd_epi32(acc[b], w2, qc);
+                acc[b] = _mm512_dpbusd_epi32(acc[b], w3, qd);
+            }
+        }
+        for (; g < f_groups; ++g) {
+            const size_t f4_offset = static_cast<size_t>(g) * 64;
+            const __m512i w = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + f4_offset));
+            for (int b = 0; b < B; ++b) {
+                uint32_t hq4;
+                std::memcpy(&hq4, &hq[b][g * 4], sizeof(hq4));
+                const __m512i hq4_i32 = _mm512_set1_epi32(static_cast<int32_t>(hq4));
+                acc[b] = _mm512_dpbusd_epi32(acc[b], w, hq4_i32);
+            }
+        }
+
+        for (int b = 0; b < B; ++b) {
+            const __m512 down_scale = _mm512_set1_ps(s_h[b] * s_down);
+            _mm512_storeu_ps(out_list[b] + d,
+                             _mm512_mul_ps(_mm512_cvtepi32_ps(acc[b]), down_scale));
+        }
+    }
 }
 
 static void expert_ffn(const uint8_t* __restrict w_gate,
@@ -1403,6 +1599,114 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     // count varies wildly with N (5 for S1, 3072 for S4).  Cap the team size
     // so small-N cases don't pay OpenMP's per-thread overhead for threads
     // that have nothing to do, while large-N cases still scale out.
+
+    // S4 only (large N AND E==512): batched FFN with ZMM weight reuse.
+    // Each expert's B tokens are processed in one call, loading weights once
+    // and reusing across the inner B-loop.  Validated in round-004 (S4
+    // -40.43%); the noinline+cold above isolate S1/S2/S3 from the binary-level
+    // side effect that caused the +11472% S2 regression.  Guarded to S4 only:
+    // S1 (5 tasks), S2 (intra path), S3 (E=16) all fall through to per-task.
+    const bool use_batched_ffn = (total_tasks >= 32) && (d_model >= 512)
+                                 && (d_ff >= 64) && (num_experts == MAX_NUM_EXPERTS);
+
+    if (use_batched_ffn) {
+        // Step 1: count-sort (token,slot) tasks by expert id.
+        const int shared_bucket = num_experts;
+        for (int e = 0; e <= num_experts + 1; ++e) expert_token_count[e] = 0;
+        for (int t = 0; t < num_tokens; ++t) {
+            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+            expert_token_count[shared_bucket]++;
+            for (int s = 0; s < top_k; ++s) {
+                const int e = topk_idx[s];
+                if (e >= 0 && e < num_experts) expert_token_count[e]++;
+            }
+        }
+        expert_token_offset[0] = 0;
+        for (int e = 1; e <= num_experts + 1; ++e) {
+            expert_token_offset[e] = expert_token_offset[e - 1] + expert_token_count[e - 1];
+        }
+        for (int e = 0; e <= num_experts; ++e) expert_token_count[e] = expert_token_offset[e];
+        for (int t = 0; t < num_tokens; ++t) {
+            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+            sorted_token_ids[expert_token_count[shared_bucket]] = t;
+            sorted_slot_ids[expert_token_count[shared_bucket]] = 0;
+            expert_token_count[shared_bucket]++;
+            for (int s = 0; s < top_k; ++s) {
+                const int e = topk_idx[s];
+                if (e >= 0 && e < num_experts) {
+                    sorted_token_ids[expert_token_count[e]] = t;
+                    sorted_slot_ids[expert_token_count[e]] = s + 1;
+                    expert_token_count[e]++;
+                }
+            }
+        }
+
+        // Step 2: build flat batch list (B = EXPERT_FFN_BATCH_B_MAX, last batch shorter).
+        int num_batches = 0;
+        for (int e = 0; e <= num_experts; ++e) {
+            const int start = expert_token_offset[e];
+            const int count = expert_token_offset[e + 1] - start;
+            if (count == 0) continue;
+            const int is_shared = (e == shared_bucket) ? 1 : 0;
+            for (int b0 = 0; b0 < count; b0 += EXPERT_FFN_BATCH_B_MAX) {
+                const int B = (count - b0 < EXPERT_FFN_BATCH_B_MAX)
+                                  ? (count - b0) : EXPERT_FFN_BATCH_B_MAX;
+                batch_expert_id[num_batches] = e;
+                batch_B[num_batches] = B;
+                batch_token_start[num_batches] = start + b0;
+                batch_is_shared[num_batches] = is_shared;
+                ++num_batches;
+            }
+        }
+
+        // Step 3: parallel-for over batches (dynamic schedule per IDEA-003 lesson).
+        const int batch_threads = (num_batches < 16) ? num_batches : 16;
+#pragma omp parallel for if (num_batches >= 2) schedule(dynamic, 1) num_threads(batch_threads)
+        for (int bi = 0; bi < num_batches; ++bi) {
+            const int e = batch_expert_id[bi];
+            const int B = batch_B[bi];
+            const int token_start = batch_token_start[bi];
+            const int is_shared = batch_is_shared[bi];
+
+            const uint8_t* w_gate;
+            const uint8_t* w_up;
+            const uint8_t* w_down;
+            float s_gate, s_up, s_down;
+            if (is_shared) {
+#if USE_AMX
+                w_gate = w_sh_gate_vnni; w_up = w_sh_up_vnni; w_down = w_sh_down_vnni;
+#else
+                w_gate = w_sh_gate_transpose; w_up = w_sh_up_transpose; w_down = w_sh_down_transpose;
+#endif
+                s_gate = w.sh_s_gate; s_up = w.sh_s_up; s_down = w.sh_s_down;
+            } else {
+                w_gate = w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model;
+                w_up   = w_up_transpose   + static_cast<size_t>(e) * d_ff * d_model;
+                w_down = w_down_transpose + static_cast<size_t>(e) * d_model * d_ff;
+                s_gate = w.s_gate[e]; s_up = w.s_up[e]; s_down = w.s_down[e];
+            }
+
+            const int8_t* xq_list[EXPERT_FFN_BATCH_B_MAX];
+            float s_x_list[EXPERT_FFN_BATCH_B_MAX];
+            int32_t x_sum_list[EXPERT_FFN_BATCH_B_MAX];
+            float* out_list[EXPERT_FFN_BATCH_B_MAX];
+            for (int b = 0; b < B; ++b) {
+                const int task_idx = token_start + b;
+                const int t = sorted_token_ids[task_idx];
+                const int slot = sorted_slot_ids[task_idx];
+                xq_list[b] = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+                s_x_list[b] = x_scale_workspace[t];
+                x_sum_list[b] = x_sum_workspace[t];
+                out_list[b] = expert_out_workspace +
+                              static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                              static_cast<size_t>(slot) * MAX_D_MODEL;
+            }
+
+            expert_ffn_batch(w_gate, w_up, w_down, s_gate, s_up, s_down,
+                             xq_list, s_x_list, x_sum_list, out_list,
+                             B, d_model, d_ff);
+        }
+    } else {
     const int ffn_threads_cap = (total_tasks < 64) ? total_tasks : 16;
 #pragma omp parallel for if (total_tasks >= 2) schedule(static) num_threads(ffn_threads_cap)
     for (int task = 0; task < total_tasks; ++task) {
@@ -1433,6 +1737,7 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                        w.s_gate[e], w.s_up[e], w.s_down[e], xq,
                        x_scale_workspace[t], out, d_model, d_ff);
         }
+    }
     }
     }
 
