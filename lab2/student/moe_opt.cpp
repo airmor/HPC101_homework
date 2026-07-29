@@ -1600,14 +1600,16 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     // so small-N cases don't pay OpenMP's per-thread overhead for threads
     // that have nothing to do, while large-N cases still scale out.
 
-    // S4 only (large N AND E==512): batched FFN with ZMM weight reuse.
+    // Batched FFN with ZMM weight reuse (S4 large-N and S3).
     // Each expert's B tokens are processed in one call, loading weights once
     // and reusing across the inner B-loop.  Validated in round-004 (S4
-    // -40.43%); the noinline+cold above isolate S1/S2/S3 from the binary-level
-    // side effect that caused the +11472% S2 regression.  Guarded to S4 only:
-    // S1 (5 tasks), S2 (intra path), S3 (E=16) all fall through to per-task.
-    const bool use_batched_ffn = (total_tasks >= 32) && (d_model >= 512)
-                                 && (d_ff >= 64) && (num_experts == MAX_NUM_EXPERTS);
+    // -40.43%); the noinline+cold above isolate S1/S2 from the binary-level
+    // side effect that caused the +11472% S2 regression.  S3 (E=16, d_model=256)
+    // also takes the batched path: its per-expert weight load is 31.6% of S3
+    // CPU (006v2 VTune), so ZMM register reuse across B tokens cuts load
+    // bandwidth.  S1 (5 tasks < 32) falls through to per-task; S2 takes intra.
+    const bool use_batched_ffn = (total_tasks >= 32) && (d_ff >= 64)
+                                 && (d_model >= 256);
 
     if (use_batched_ffn) {
         // Step 1: count-sort (token,slot) tasks by expert id.
