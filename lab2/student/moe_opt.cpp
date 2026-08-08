@@ -1743,13 +1743,13 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     }
     }
 
-    // Combine: y_t = x_t + 1*o_shared + sum_k gate_k * o_k.  Fused into a
-    // single parallel region with the FFN stage via nowait so tokens whose
-    // FFN work is done can start combining without waiting for the rest.
-    // (The dependency is per-token: combine[t] only reads expert_out[t],
-    // which that same task wrote.  We still need the per-token barrier that
-    // the second loop's omp for provides, so we keep two loops in one
-    // region rather than adding nowait.)
+    // Combine: y_t = x_t + 1*o_shared + sum_k gate_k * o_k.  Single streaming
+    // pass over d: yt is kept in a ZMM register (or reloaded once per block),
+    // residual+shared added first, then each routed expert's gate*o_k fused in
+    // via fmadd.  This halves the number of y-stream passes vs the previous
+    // (top_k+1)-pass version and keeps o_shared/o_k in cache while yt is live.
+    // For top_k=4 (S1/S2/S3) this is 1 pass with 4 fmadd/block instead of 5;
+    // for top_k=2 (S4) it is 1 pass with 2 fmadd/block instead of 3.
 #pragma omp parallel for if (num_tokens >= 4) schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* const xt = x + static_cast<size_t>(t) * d_model;
@@ -1760,20 +1760,23 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
         const float* const outs = expert_out_workspace +
                                   static_cast<size_t>(t) * slots * MAX_D_MODEL;
 
-        // Start from residual + shared expert (gate 1).
+        // Precompute each routed expert's normalized gate once per token.
         const float* o_shared = outs;
-        for (int d = 0; d < d_model; d += 16) {
-            _mm512_storeu_ps(yt + d, _mm512_add_ps(_mm512_loadu_ps(xt + d),
-                                                    _mm512_loadu_ps(o_shared + d)));
-        }
+        __m512 gk[MAX_TOP_K];
         for (int k = 0; k < top_k; ++k) {
             const int e = topk_idx[k];
-            const __m512 gate = _mm512_set1_ps(scores[e] * inv_gate_sum);
-            const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
-            for (int d = 0; d < d_model; d += 16) {
-                _mm512_storeu_ps(yt + d, _mm512_fmadd_ps(gate, _mm512_loadu_ps(o_k + d),
-                                                          _mm512_loadu_ps(yt + d)));
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+
+        // Single streaming pass: yt = xt + o_shared + sum_k gk[k]*o_k.
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
             }
+            _mm512_storeu_ps(yt + d, acc);
         }
     }
 }
