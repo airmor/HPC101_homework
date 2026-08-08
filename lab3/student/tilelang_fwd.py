@@ -70,10 +70,6 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
             # ---- gate ----
             g_shared = T.alloc_shared((block_S,), dtype=T.float32)
             beta_shared = T.alloc_shared((block_S,), dtype=T.float32)
-            # 预算 exp(g) 和 1/exp(g), 复用到 βγK/ds/O_st/gate_V_new, 省大量 exp2
-            g_exp_shared = T.alloc_shared((block_S,), dtype=T.float32)   # exp2(g*log2e)
-            g_inv_shared = T.alloc_shared((block_S,), dtype=T.float32)   # exp2(-g*log2e)=1/g_exp
-            beta_g_shared = T.alloc_shared((block_S,), dtype=T.float32)  # beta*g_exp (bkg 用)
             g_last_local = T.alloc_local((1,), T.float32)
             gl_local = T.alloc_local((1,), T.float32)
 
@@ -126,17 +122,12 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                 g_last_local[0] = g_cumsum[bb, left + length - 1, bh]
                 gl_local[0] = T.exp2(g_last_local[0] * LOG2E)
 
-                # 预算 exp(g)/1/exp(g)/beta*g_exp, 复用省 exp2
-                for t in T.Parallel(block_S):
-                    g_exp_shared[t] = T.exp2(g_shared[t] * LOG2E)
-                    g_inv_shared[t] = T.exp2(-g_shared[t] * LOG2E)
-                    beta_g_shared[t] = beta_shared[t] * g_exp_shared[t]
-
                 # ============ P1: state-free ============
-                # 2. βγK = K ⊙ (beta * g_exp)  (复用 beta_g_shared, 1 次乘法)
+                # 2. βγK = K ⊙ β ⊙ γ  (inline exp2, 短序列 chunk 少, 避免 exp 复用的循环开销)
                 for t, d in T.Parallel(block_S, DK):
                     bkg_shared[t, d] = T.cast(
-                        T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
+                        T.cast(K_shared[t, d], T.float32) * beta_shared[t]
+                        * T.exp2(g_shared[t] * LOG2E), T.bfloat16)
 
                 # 3. βV = V ⊙ β,  U = A @ βV -> bv_shared
                 for t, d in T.Parallel(block_S, block_DV):
@@ -145,11 +136,12 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                 T.gemm(A_shared, bv_shared, tmp_dv, clear_accum=True)
                 T.copy(tmp_dv, bv_shared)   # bv_shared = U (BF16)
 
-                # 4. ds = Lower(QKᵀ) ⊙ (g_exp_i * g_inv_j)  (复用, 无 exp2)
+                # 4. ds = Lower(QKᵀ) ⊙ exp(g_i - g_j)  (inline exp2)
                 T.gemm(Q_shared, K_shared, ds_tmp, transpose_B=True, clear_accum=True)
                 for i, j in T.Parallel(block_S, block_S):
                     if i >= j:
-                        ds_tmp[i, j] = ds_tmp[i, j] * g_exp_shared[i] * g_inv_shared[j]
+                        ds_tmp[i, j] = ds_tmp[i, j] * T.exp2(
+                            (g_shared[i] - g_shared[j]) * LOG2E)
                     else:
                         ds_tmp[i, j] = 0
                 T.copy(ds_tmp, ds_shared)
@@ -172,11 +164,10 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                 T.copy(tmp_dv, V_new_shared)
 
                 # ============ P3: 输出 (用 S_old, 在更新 S 之前!) ============
-                # 6. O = scale * [γ⊙(Q@S_old) + ds@V_new]
-                #    O_st = g_exp ⊙ (Q@S) -> O_fragment (复用 g_exp_shared, 无 exp2)
+                # 6. O = scale * [γ⊙(Q@S_old) + ds@V_new]  (inline exp2)
                 T.gemm(Q_shared, s_shared, O_fragment, clear_accum=True)
                 for t, d in T.Parallel(block_S, block_DV):
-                    O_fragment[t, d] = g_exp_shared[t] * O_fragment[t, d]
+                    O_fragment[t, d] = T.exp2(g_shared[t] * LOG2E) * O_fragment[t, d]
                 # O += ds@V_new (累加, 不 clear)
                 T.gemm(ds_shared, V_new_shared, O_fragment, clear_accum=False)
                 # 统一乘 scale 写回
@@ -186,9 +177,10 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                             (DK ** -0.5) * O_fragment[t, d], T.bfloat16)
 
                 # ---- P2 续: 更新 state ----
-                # 7. gate V_new: V_new *= exp(γr - g) = gl * g_inv  (复用, 无 exp2)
+                # 7. gate V_new: V_new *= exp(γr - g) (inline exp2)
                 for t, d in T.Parallel(block_S, block_DV):
-                    tmp_dv[t, d] = tmp_dv[t, d] * gl_local[0] * g_inv_shared[t]
+                    tmp_dv[t, d] = tmp_dv[t, d] * T.exp2(
+                        (g_last_local[0] - g_shared[t]) * LOG2E)
                 T.copy(tmp_dv, V_new_shared)
                 # 8. S *= γr
                 for t, d in T.Parallel(DK, block_DV):
