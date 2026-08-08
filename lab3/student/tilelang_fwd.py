@@ -229,15 +229,11 @@ def gdn_prefill_forward(
             dtype=torch.float32, device=q.device,
         )
 
-    # block_DV: dv 切片大小 (split-dv 的杠杆)。
-    # MIG 10G 只有 14 SM: B*Hv >= 14 时已能填满, 用 block_DV=128 (不 split, 大 tile TC 效率高);
-    # B*Hv < 14 时 split-dv 提并行度, 用 block_DV=64。
-    # (实测 block_DV=32 过细, 开销 > 收益)
-    parallelism = batch_size * num_heads_v
-    if parallelism >= 16:
-        block_DV = head_dim_v            # 不 split (128)
-    else:
-        block_DV = min(64, head_dim_v)
+    # block_DV=64 是实测甜点:
+    #   - 128 会令 s_fragment [128,128]=64KB 寄存器溢出, 反而变慢 (parallel_equal 0.44->0.94)
+    #   - 32 过细, launch/同步开销 > 收益
+    #   MIG 10G 14 SM 下, block_DV=64 对所有 case 都不差, 后续可用 autotune 精调。
+    block_DV = 64
     threads = 128
     num_stages = 2
 
