@@ -80,6 +80,7 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
 
             # ---- ds = Lower(QKᵀ) ⊙ decay  [64,64] ----
             ds_fragment = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            ds_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)   # BF16 供 GEMM 操作数
 
             # ---- 输出累加器 ----
             O_st_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
@@ -163,6 +164,7 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                         )
                     else:
                         ds_fragment[i, j] = 0
+                T.copy(ds_fragment, ds_shared)   # FP32 fragment -> BF16 shared, 供 ds@V_new GEMM
 
                 # ---- P2: 递推 (依赖 S_old) ----
                 # 5. V_new = U - W @ S_old
@@ -179,7 +181,7 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
 
                 # 7. O_in = scale * (ds @ V_new)
                 T.copy(V_new_fragment, V_new_shared)
-                T.gemm(ds_fragment, V_new_shared, O_in_fragment, clear_accum=True)
+                T.gemm(ds_shared, V_new_shared, O_in_fragment, clear_accum=True)
                 for t, d in T.Parallel(block_S, block_DV):
                     O_in_fragment[t, d] = (DK ** -0.5) * O_in_fragment[t, d]
 
