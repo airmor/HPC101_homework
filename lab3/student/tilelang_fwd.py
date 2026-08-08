@@ -93,11 +93,9 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
             T.use_swizzle(10)
 
             # ---- 初始化 state ----
-            if initial_state is not None:
-                T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
-                T.copy(s_shared, s_fragment)
-            else:
-                T.clear(s_fragment)
+            # wrapper 保证 initial_state 非 None (None 时传零张量), 这里统一 copy
+            T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
+            T.copy(s_shared, s_fragment)
 
             # ================ chunk 递推循环 ================
             for i_c in T.Pipelined(num_chunks, num_stages=num_stages):
@@ -223,6 +221,13 @@ def gdn_prefill_forward(
     """GDN prefill 前向 (朴素 V_new 形式)。"""
     batch_size, num_tokens, num_heads_qk, head_dim_k = q.shape
     _, _, num_heads_v, head_dim_v = v.shape
+
+    # initial_state 为 None 时, 传零张量 (TileLang kernel 参数不能为 NULL)
+    if initial_state is None:
+        initial_state = torch.zeros(
+            (batch_size, num_heads_v, head_dim_k, head_dim_v),
+            dtype=torch.float32, device=q.device,
+        )
 
     block_DV = 64 if head_dim_v >= 64 else head_dim_v
     threads = 128
