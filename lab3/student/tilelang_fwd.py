@@ -65,7 +65,9 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
             # ---- state-free 中间量 ----
             bkg_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)   # βγK
             bv_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)  # βV
-            W_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)    # W = A@(βγK)
+            # W = A@(βγK): 先算进 fragment, 再 copy 到 shared 供下一 GEMM 当操作数
+            W_fragment = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            W_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
             U_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)  # U = A@(βV)
             V_new_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
             V_new_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
@@ -140,8 +142,9 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                         * T.exp2(g_shared[t] * LOG2E),
                         T.bfloat16,
                     )
-                # W = A @ βγK
-                T.gemm(A_shared, bkg_shared, W_shared, clear_accum=True)
+                # W = A @ βγK  (A [64,64] × βγK [64,128] -> W [64,128])
+                T.gemm(A_shared, bkg_shared, W_fragment, clear_accum=True)
+                T.copy(W_fragment, W_shared)   # fragment -> shared, 供 W@S 用
 
                 # 3. βV = V ⊙ β,  U = A @ βV
                 for t, d in T.Parallel(block_S, block_DV):
