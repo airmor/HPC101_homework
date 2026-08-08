@@ -235,7 +235,7 @@ def gdn_prefill_forward(
     #   MIG 10G 14 SM 下, block_DV=64 对所有 case 都不差, 后续可用 autotune 精调。
     block_DV = 64
     threads = 128
-    num_stages = 3
+    num_stages = 2
 
     kernel = _gdn_naive_kernel(
         batch_size, num_tokens, num_heads_qk, num_heads_v,
