@@ -83,6 +83,7 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                 bv_shared: tilelang.layout.make_swizzled_layout(bv_shared),
             })
             T.use_swizzle(10)
+            T.disable_warp_group_reg_alloc()   # 让编译器自由分配寄存器, 降压力
 
             # ---- 初始化 state ----
             T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
@@ -254,6 +255,7 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
                 bv_shared: tilelang.layout.make_swizzled_layout(bv_shared),
             })
             T.use_swizzle(10)
+            T.disable_warp_group_reg_alloc()   # 让编译器自由分配寄存器, 降压力
 
             T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
             T.copy(s_shared, s_fragment)
