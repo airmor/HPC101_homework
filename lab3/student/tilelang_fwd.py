@@ -366,19 +366,20 @@ def gdn_prefill_forward(
             dtype=torch.float32, device=q.device,
         )
 
-    block_DV = 64
     threads = 128
     num_stages = 2
 
     # per-case 分发 (实测依据, H800 MIG 10G):
-    #   短序列 (T<=2048): 结合律版寄存器少, launch 开销占比大, 受益
-    #   长序列 (T>2048): 物化W版 GEMM 数少, chunk 多时累积开销小
+    #   短序列 (T<=2048): 结合律版 block_DV=64, 寄存器少, launch 开销占比大, 受益
+    #   长序列 (T>2048): 物化W版 block_DV=64, GEMM 数少 (32 会令 TC 效率下降)
     if num_tokens <= 2048:
+        block_DV = 64
         kernel = _gdn_naive_kernel(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
             head_dim_k, head_dim_v, block_DV, threads, num_stages,
         )
     else:
+        block_DV = 64
         kernel = _gdn_naive_kernel_matw(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
             head_dim_k, head_dim_v, block_DV, threads, num_stages,
