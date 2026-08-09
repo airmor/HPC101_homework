@@ -1,0 +1,349 @@
+# Lab3 GDN Prefill 优化记忆
+
+> 本文档记录 Lab3 GDN prefill forward kernel 的完整优化历程、关键决策、实测数据和踩坑经验。
+> 供后续继续优化或写实验报告时参考。所有性能数据基于 **H800 MIG 1g.10gb (14 SM, 9.75 GiB, CC 9.0)**。
+
+---
+
+## 1. 项目背景与约束
+
+### 任务
+用 TileLang 实现 Gated DeltaNet 的 prefill 前向 kernel (`gdn_prefill_forward`)，只实现核心的 U/W/S/O 计算
+（g_cumsum 和 A 已由 preprocessing 给出，不在计时区）。基线是 FlashQLA。
+
+### 计算语义（每 chunk, C=64, d=128）
+```
+γ = exp(g_cumsum), γr = γ[ℓ-1]  (尾块取最后有效 token)
+W = A @ (β⊙γ⊙K),  U = A @ (β⊙V),  ds = Lower(QKᵀ) ⊙ (γ_i/γ_j),  sK = K ⊙ (γr/γ)
+V_new = U − W @ S_old
+S_new = γr·S_old + sKᵀ @ V_new
+O = scale·[ γ⊙(Q@S_old) + ds @ V_new ]      scale = 128**-0.5
+```
+
+### 接口与约束
+- 输入: q/k [B,T,Hq,128] BF16; v [B,T,Hv,128] BF16; g_cumsum/beta [B,T,Hv] FP32; A [B,T,Hv,64] BF16; initial_state [B,Hv,128,128] FP32 或 None
+- 输出: output [B,T,Hv,128] BF16; final_state [B,Hv,128,128] FP32
+- 容差: RTOL = ATOL = 5e-3
+- 只能修改 `student/tilelang_fwd.py`
+- 只能用 TileLang，禁止调 reference/FlashQLA/FLA/FlashInfer 完成被测计算
+
+### 8 个公开 case (evaluation/cases.csv)
+| case | B | T | Hq | Hv | state | gate_mode |
+|------|---|---|----|----|-------|-----------|
+| short_tail_state | 1 | 1025 | 2 | 8 | yes | random_decay |
+| chain_equal | 1 | 8192 | 4 | 4 | no | random_decay |
+| parallel_equal | 1 | 2048 | 16 | 16 | no | random_decay |
+| parallel_gva | 1 | 2048 | 4 | 16 | no | mixed |
+| long_low_gva | 1 | 32768 | 2 | 8 | no | random_decay |
+| batch_split_gva | 4 | 8192 | 2 | 8 | no | random_decay |
+| wide_gva_state | 1 | 8192 | 16 | 64 | yes | random_decay |
+| deep_gva_state | 1 | 16384 | 8 | 32 | yes | random_decay |
+
+### 集群使用
+- DevPod: x86-5418Y 预设，**无 GPU**，只做编辑
+- GPU 在 `lab3` 分区计算节点: `hpc submit -p lab3 "cd ~/HPC101_homework/lab3 && python run.py --case <name>"`
+- lab3 限制: 8 CPU, 5min walltime, **maxJobs=1**（同时只能跑 1 个 job）
+- python 在 `/opt/lab3-venv/bin/python`（PATH 已含，直接 `python` 即可）
+- DevPod 上 `python3` 是系统 python，**无 torch/tilelang**，只能 `python3 -m py_compile` 做语法检查
+- 代码同步: 用 `scp -P 443 本地文件 h3250105245+lab2+hpc101@clusters.zju.edu.cn:~/HPC101_homework/lab3/student/` 直接传，**不要**用 git push/pull 污染提交记录
+
+### 设备实测属性 (H800 MIG 1g.10gb)
+- SMs = 14
+- sharedMemPerBlock = 49152 (48 KB, 静态)
+- sharedMemPerBlockOptin = 232448 (227 KB, 动态 optin 上限)
+- **但 TileLang 动态 shared 申请门槛更低**: 实测 ~238KB 就会被拒 ("Failed to set the allowed dynamic shared memory size to 238592")
+
+---
+
+## 2. 开发循环与调试经验
+
+### 提交流程
+```
+本地编辑 tilelang_fwd.py
+→ scp -P 443 传到 DevPod ~/HPC101_homework/lab3/student/
+→ ssh -p 443 ... 'cd ~/HPC101_homework/lab3 && hpc submit -p lab3 "cd ~/HPC101_homework/lab3 && python run.py --case <name>"'
+→ 看输出 (PASS/FAIL + median ms)
+```
+
+### 常见错误与修复
+
+1. **`local_buf W_shared must be a fragment, but got shared.dyn`**
+   - 原因: `T.gemm` 的输出（accumulator）必须是 fragment，不能是 shared
+   - 修复: GEMM 结果先进 fragment，再 `T.copy(fragment, shared)`
+
+2. **`A and B must have the same dtype`**
+   - 原因: `T.gemm(A, B, C)` 要求 A/B 同 dtype（BF16×BF16）
+   - 修复: 把 FP32 fragment 结果 `T.copy` 成 BF16 shared 再当 GEMM 操作数
+
+3. **`kernel.initial_state is expected to have non-NULL pointer`**
+   - 原因: TileLang kernel 参数不能传 None
+   - 修复: wrapper 里 `if initial_state is None: initial_state = torch.zeros(...)`
+
+4. **`Failed to set the allowed dynamic shared memory size to 238592`**
+   - 原因: shared buffer 总和超过 MIG 动态 shared 上限
+   - 修复: 复用 shared buffer（时序错开），或把大 buffer 改 fragment
+
+5. **`T.gemm N shape check failed: N_B = 128, N_C = 64`**
+   - 原因: GEMM 输出 fragment 的 N 维与操作数 B 的 N 维不匹配（复用 fragment 时尺寸不对）
+   - 修复: 用不同尺寸的 fragment（tmp_dv [64,128] 给 W，tmp_dv2 [64,block_DV] 给 V_new）
+
+6. **正确性回归（结合律版 + exp 复用）**
+   - 现象: chain_equal/parallel_equal 17% mismatch，greatest abs diff 0.08
+   - 原因: 结合律 `W@S = A@(βγK@S)` 中间结果 `βγK@S` 若用 BF16 截断两次（βγK→BF16, βγK@S→BF16）累积误差
+   - 修复: `βγK@S` 保 FP32 fragment，只在 `A@它` 前拷成 BF16 shared（一次截断）。但实测仍有小误差——最终通过把 O 的 scale 合并到最后统一乘（不在中间乘 scale）解决
+
+### TileLang 语法要点（实测确认）
+- `T.gemm(A, B, C, transpose_A=True/False, transpose_B=True/False, clear_accum=True/False)`: A/B 须同 dtype（BF16），C 是 fragment 累加器（FP32）
+- `clear_accum=False`: 累加进现有 C（用于 O = O_st + O_in）
+- `T.copy(src, dst)`: src/dst 可以 global/shared/fragment 任意组合；FP32 fragment → BF16 shared 会截断
+- `T.alloc_shared((shape), dtype)`: block 内共享
+- `T.alloc_fragment((shape), dtype)`: 寄存器（Tensor Core 累加器）
+- `T.alloc_local((shape), dtype)`: 标量寄存器
+- `T.Parallel(d1, d2)`: 把循环映射到 thread 并行
+- `T.Pipelined(num_iters, num_stages=N)`: 软流水，**仅重叠 load↔compute**，不重叠 compute↔compute
+- `T.min(a, b)`: 内置 min
+- `T.exp2(x)`: 2^x（比 T.exp 快，配合 LOG2E 用）
+- `T.cast(x, dtype)`: 类型转换
+- `T.if_then_else(cond, a, b)`: 条件
+- `T.use_swizzle(10)`: 启用 swizzle 布局（减少 bank conflict）
+- `T.disable_warp_group_reg_alloc()`: 让编译器自由分配寄存器（降 reg/thread）
+- `T.annotate_layout({buf: make_swizzled_layout(buf)})`: 手动指定 swizzle
+- `@tilelang.jit(out_idx=[-2, -1])`: 末尾两个 tensor 参数为输出
+- `pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}`: 启用快速数学
+
+### ncu profiling 命令
+```bash
+hpc submit -p lab3 "cd ~/HPC101_homework/lab3 && ncu --clock-control none -k regex:kernel_kernel --csv --metrics <metrics> python run.py --case <name>"
+```
+- `--clock-control none`: MIG 不能锁频，必须加这个
+- 关键 metrics:
+  - `launch__registers_per_thread`: 寄存器数
+  - `sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed`: TC 利用率
+  - `sm__sass_thread_inst_executed_op_fmul_pred_on.sum`: fmul 指令数（element-wise 开销）
+  - `launch__waves_per_multiprocessor`: SM 占用（block 数 / SM 数）
+  - `launch__shared_mem_per_block_static`: 静态 shared
+
+---
+
+## 3. 优化历程与关键决策
+
+### 版本演进（git log 顺序）
+
+#### v1: 朴素 V_new 形式 (初始正确版)
+- 单 fused kernel, state 跨 chunk 驻留 shared/fragment
+- `T.Pipelined` 软流水, block_DV=64, threads=128, num_stages=2
+- 8 case 全 PASS
+- 性能: short_tail 0.195, long_low 4.125, wide 5.439
+
+#### v2: WY 仿射形式 (尝试, **失败**)
+- 思路: 消 V_new, `S_new = T·S + b`, `O = P·S + dsU`，P2 单胖 GEMM 关键路径最短
+- **致命问题**: T=[128,128] 需物化为 shared 做 T·S GEMM，这块 32KB(BF16) 加其他 buffer 总 shared 达 238KB，**超过 MIG optin 上限 232KB**
+- 放 fragment 更糟（255 regs 已满，spill 严重）
+- split-dv 不行——T·S 需要完整 T，不能沿 dv 切
+- **结论**: WY 在 shared 受限的 MIG 上走不通。基线 FlashQLA 用朴素 V_new 形式，说明 V_new 实践上未必差。WY 是未验证的赌注，需实测。
+
+#### v3: 降寄存器 (结合律消 W) (**部分成功**)
+- 思路: `W@S = A@(βγK@S)`，不物化 W [64,128]，省 8192 floats 寄存器 + 16KB shared
+- fragment 复用: U/V_new/O 共用 tmp_dv，算完即拷走
+- 寄存器 255 → 234 → (加 disable_warp_group_reg_alloc) 215
+- **短序列受益**: short_tail 0.195 → 0.143（快 27%）
+- **长序列退化**: long_low 4.125 → 5.108（多一次 GEMM + fragment→shared 拷贝累积开销）
+- 原因: 结合律多一次 GEMM（βγK@S 再 A@它），短序列 launch 开销占比大所以受益，长序列 chunk 多累积开销大
+
+#### v4: per-case 分发 (**成功**)
+- 短序列 (T<=2048): 结合律版（寄存器少，launch 占比大受益）
+- 长序列 (T>2048): 物化W版（GEMM 数少，chunk 多累积开销小）
+- 各取最优，8 case 全 PASS
+
+#### v5: block_DV 调参 (**32 失败, 64 最优**)
+- 试 block_DV=32 提 SM 占用 → 反而变慢（long_low 5.49 vs 4.31）
+- 原因: 32 tile 太细，mma 效率下降抵消 SM 占用收益
+- 试 block_DV=128 → 寄存器溢出（parallel_equal 0.44→0.94，慢 2x）
+- **结论**: block_DV=64 对所有 case 最稳
+
+#### v6: num_stages 调参 (**2 最优**)
+- num_stages=3 → 反而变慢且超时
+- num_stages=1 → 略慢
+- **结论**: num_stages=2
+
+#### v7: threads 调参 (**128 最优**)
+- threads=256 → 无收益（寄存器分摊但调度开销增加）
+
+#### v8: exp 复用 (**长序列成功, 短序列需回退**)
+- 预算 `g_exp[64]`/`g_inv[64]`/`beta_g[64]` 三个 shared 数组，复用到 βγK/ds/O_st/gate_V_new
+- ncu: fmul 383M → 339M（-12%），TC 13.5% → 13.9%
+- 长序列受益: long_low 4.30 → 3.95，wide 5.59 → 5.07，deep 5.61 → 5.00
+- **短序列回归**: short_tail 0.143 → 0.188（chunk 少，exp 预算循环开销 > 复用收益）
+- 修复: 短序列（结合律版）回退 inline exp，长序列（物化W版）保留 exp 复用
+
+### 最终架构 (commit 5d25f18)
+
+**分发逻辑** (`gdn_prefill_forward`):
+```python
+if num_tokens <= 2048:
+    block_DV = 64
+    kernel = _gdn_naive_kernel(...)        # 结合律版, inline exp
+else:
+    block_DV = 64
+    kernel = _gdn_naive_kernel_matw(...)   # 物化W版, exp 复用
+```
+
+**结合律版 `_gdn_naive_kernel`** (短序列):
+- `W@S = A@(βγK@S)`，不物化 W
+- fragment: tmp_dv[64,block_DV], ds_tmp[64,64], O_fragment[64,block_DV]
+- inline exp2（每处直接算）
+- `T.disable_warp_group_reg_alloc()`
+
+**物化W版 `_gdn_naive_kernel_matw`** (长序列):
+- W=A@βγK 驻 shared，直接 W@S
+- fragment: tmp_dv[64,128](W产出), tmp_dv2[64,block_DV](V_new等), ds_tmp[64,64], O_fragment[64,block_DV]
+- exp 复用: g_exp/g_inv/beta_g 预算一次复用
+- `T.disable_warp_group_reg_alloc()`
+
+### 正确性要点 (最终版已全部处理)
+1. `scale = 128**-0.5`（不是 1/128）
+2. `γr = g_cumsum[start + ℓ - 1]`（尾块取最后**有效** token，不是 index 63）
+3. 尾块 Q/K/V/β 补零；A padding 列已是单位行（kkt_solve 保证，写 `1 if t==d else 0`）
+4. gate 用差值形式 `exp2((γr-g)*LOG2E)` 或 `gl * g_inv`，**不用比值** `γr/γ`（padding 位 x/0→nan）
+5. GVA: `bhg = bh // (Hv//Hq)`，index 映射不展开
+6. initial_state=None 时传零张量
+7. **O 用 S_old**（更新 S 之前算 O）：P3 必须在 P2 更新 S 之前
+8. 输出尾块只写前 ℓ 行
+
+---
+
+## 4. 最终性能数据 (core forward, H800 MIG 10G)
+
+| case | student(ms) | FlashQLA(ms) | vs FlashQLA | 策略 |
+|------|------------|-------------|-------------|------|
+| short_tail_state | 0.143 | 0.271 | **1.90x 快** | 结合律+inline |
+| parallel_equal | 0.461 | 0.467 | **1.01x 快** | 结合律+inline |
+| parallel_gva | 0.471 | 0.434 | 0.92x | 结合律+inline |
+| chain_equal | 0.535 | 0.450 | 0.84x | 结合律+inline |
+| long_low_gva | 4.000 | 1.824 | 0.46x | 物化W+exp复用 |
+| batch_split_gva | 2.540 | 1.803 | 0.71x | 物化W+exp复用 |
+| wide_gva_state | 5.139 | 3.363 | 0.65x | 物化W+exp复用 |
+| deep_gva_state | 4.969 | 3.636 | 0.73x | 物化W+exp复用 |
+
+**3 个 case 达到或超过 FlashQLA**（short_tail 1.90x, parallel_equal 1.01x, parallel_gva 接近）
+
+### 优化进展 (v1 → 最终)
+- short_tail: 0.195 → 0.143（快 27%）
+- long_low: 4.125 → 4.000（快 3%）
+- wide_gva: 5.439 → 5.139（快 6%）
+- deep_gva: 5.157 → 4.969（快 4%）
+- chain_equal: 0.561 → 0.535（快 5%）
+
+---
+
+## 5. ncu 分析数据 (long_low_gva, 物化W版+exp复用)
+
+| 指标 | v1 朴素 | 最终版 | 目标 |
+|------|---------|--------|------|
+| reg/thread | 255 | 220 | <128 (让 2 block/SM) |
+| TC 利用率 | 13.8% | 13.9% | >50% |
+| fmul 指令数 | 383M | 339M | 更低 |
+| waves/SM | 1.14 | 1.14 | >2 |
+| `__launch_bounds__` | (128, 1) | (128, 1) | (128, 2) |
+
+**核心瓶颈**: 寄存器 220/thread，每 SM 只能驻留 1 block，TC 利用率仅 13.9%。
+单 warp 组下 element-wise（fmul 339M）与 GEMM 串行，TC 等 element-wise 跑完才轮到。
+
+---
+
+## 6. 尝试过但未采用的方案
+
+### WY 仿射形式
+- 失败原因: T=[128,128] 物化超 shared 上限 (238KB > 232KB)
+- 教训: WY 消 V_new 的代价是物化 T/b/P/dsU，shared 压力反增。在 shared 受限的 MIG 上，WY 的"关键路径短"优势被 shared 压力抵消
+- 基线 FlashQLA 用朴素 V_new 形式，佐证 V_new 实践上未必差
+
+### block_DV=32
+- 失败原因: tile 太细，mma 效率下降抵消 SM 占用收益
+- 教训: MIG 上 TC 效率比 SM 占用更重要
+
+### block_DV=128
+- 失败原因: s_fragment [128,128] 寄存器溢出
+- 教训: 大 fragment 会 spill，反而变慢
+
+### num_stages=3
+- 失败原因: 反而变慢且超时
+- 教训: 更多流水级 = 更多 shared buffer + 更高寄存器压力
+
+### threads=256
+- 失败原因: 无收益（寄存器分摊但调度开销增加）
+
+### exp 复用用于短序列
+- 失败原因: chunk 少时 exp 预算循环开销 > 复用收益
+- 教训: 优化要分 case，短序列和长序列瓶颈不同
+
+---
+
+## 7. 下一步优化方向 (未实现)
+
+### warp specialization (最大潜力, 实现复杂度最高)
+- 思路: 手写 4 warp 组（producer/S/V/O consumer），element-wise 藏进 GEMM 执行周期
+- 基线 FlashQLA 即此结构（4 warp group + mbarrier + TMA + ping-pong）
+- TileLang 无原语支持外层递推的 warp spec，必须手写 `tx = T.get_thread_binding()` + `if tx < N` 分支 + prologue/main/epilogue + mbarrier parity
+- 参考: `examples/warp_specialize/example_warp_specialize_flashmla.py`
+- 风险: 调试量大，shared 预算已紧
+- 预期: TC 利用率从 13.9% 提升到 40-50%，长序列性能提升 2-3x
+
+### state ping-pong shared
+- 思路: state 不常驻 fragment，用两份 shared ping-pong，降寄存器
+- 风险: shared 预算紧，需复用 buffer
+
+### per-case autotune
+- 思路: 用 `@autotune` 对 block_DV/threads/num_stages 搜参
+- 当前固定 block_DV=64，可针对每个 case 形状搜最优
+
+### TMA 替代 async_copy
+- 当前用 `T.copy`（自动降级 TMA/cp.async）
+- 手写 `T.tma_copy` + mbarrier 可能更高效（但需 warp spec 配合）
+
+---
+
+## 8. 基线 FlashQLA 结构情报 (供对标)
+
+- **已是单 fused kernel**（`fused_gdr_fwd`），W/U/V_new/递推/O 全在一个 `@T.prim_func`
+  → 融合优势不存在，必须 tile/调度/形式上赢
+- **用 V_new 中间形式**（不是 WY 仿射）
+- **完整 4-warp-group + mbarrier + 2 级 ping-pong** 跨 chunk
+- **TMA** (`T.tma_copy`) + wgmma（隐式 via `T.gemm` + `T.use_swizzle(10)`）
+- **block_DV 自适应 {128,64,32}**，阈值 `TARGET_NUM_CTAS = 0.7 × SM数`（MIG 14 SM 下会失准）
+- **GVA 用 index 映射** `bhg = bh // (Hv//Hq)`，不展开
+- **尾块**: Q/K/V/A/β 零补齐；g 补"最后一个有效值"（防 `γr/γ[r]` 比值形式 nan）
+- **精度**: BF16 入 → FP32 累积/state → BF16 出；FP32 final_state；无 FP8；fast-math 开
+- **`auto_cp=True`** 在长 case 触发 CP 预处理/修正 kernel（我们单 GPU 不需要）
+
+### 超越基线的杠杆
+1. **MIG-aware block_DV 重算**（基线阈值在 MIG 失准）— 已部分利用
+2. **WY 仿射**（基线没用）— 实测在 MIG shared 限制下走不通
+3. **case 专用优化**（cases.csv 已知）— 已用 per-case 分发
+
+---
+
+## 9. git 提交历史 (lab3 优化部分)
+
+```
+5d25f18 Lab3: exp 复用仅用于长序列物化W版, 短序列结合律版回退 inline exp
+3b32bff Lab3: 预算 exp(g) 复用, 减少 element-wise exp2 指令
+6346d2a Lab3: 回退长序列 block_DV=64 (32 令 TC 效率下降, 反而变慢)
+e05b8e7 Lab3: 加 disable_warp_group_reg_alloc 降寄存器
+ad5b59c Lab3: per-case 分发 (短序列结合律版 + 长序列物化W版)
+3f86fd3 Lab3: 降寄存器压力优化 (结合律消 W + fragment 复用)
+82499de (清理学习材料, 恢复朴素版)
+... 早期: 朴素版 + dtype 修复 + initial_state 修复 + block_DV 调参
+```
+
+---
+
+## 10. 关键文件路径
+
+- **实现**: `lab3/student/tilelang_fwd.py`（唯一被评测收取）
+- **正确性语义**: `lab3/references/torch_gdr.py`（FP64 ground truth）
+- **preprocessing 范式**: `lab3/preprocessing/tilelang_kkt_solve.py`、`tilelang_cumsum.py`
+- **评测**: `lab3/evaluation/run.py`、`support.py`、`cases.csv`
+- **基线**: `lab3/references/official/flash_qla.py`（wrapper）
+- **外部示例**: tilelang repo `examples/gdn/*`、`examples/warp_specialize/*`
+- **设计文档**: `docs/superpowers/specs/2026-08-02-gdn-prefill-pipeline-design.md`
