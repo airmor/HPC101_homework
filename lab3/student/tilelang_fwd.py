@@ -94,6 +94,7 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV=64, threads=128, num_stages
             T.annotate_layout({
                 V_shared: tilelang.layout.make_swizzled_layout(V_shared),
                 bv_shared: tilelang.layout.make_swizzled_layout(bv_shared),
+                bkg_shared: tilelang.layout.make_swizzled_layout(bkg_shared),
             })
             T.use_swizzle(10)
             T.disable_warp_group_reg_alloc()   # 让编译器自由分配寄存器, 降压力
@@ -272,6 +273,10 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=64, threads=128, num_s
             T.annotate_layout({
                 V_shared: tilelang.layout.make_swizzled_layout(V_shared),
                 bv_shared: tilelang.layout.make_swizzled_layout(bv_shared),
+                Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+                K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                bkg_shared: tilelang.layout.make_swizzled_layout(bkg_shared),
+                W_shared: tilelang.layout.make_swizzled_layout(W_shared),
             })
             T.use_swizzle(10)
             T.disable_warp_group_reg_alloc()   # 让编译器自由分配寄存器, 降压力
