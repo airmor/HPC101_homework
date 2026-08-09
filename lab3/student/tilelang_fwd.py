@@ -12,14 +12,27 @@
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.autotuner import autotune
 
 CHUNK_SIZE = 64
 HEAD_DIM = 128
 LOG2E = 1.4426950408889634
 
+# autotune 配置: block_DV / threads / num_stages 组合
+_AUTOTUNE_CONFIGS = [
+    {"block_DV": 64, "threads": 128, "num_stages": 1},
+    {"block_DV": 64, "threads": 128, "num_stages": 2},
+    {"block_DV": 64, "threads": 256, "num_stages": 1},
+    {"block_DV": 64, "threads": 256, "num_stages": 2},
+    {"block_DV": 32, "threads": 128, "num_stages": 2},
+    {"block_DV": 128, "threads": 128, "num_stages": 1},
+    {"block_DV": 128, "threads": 256, "num_stages": 1},
+]
 
+
+@autotune(configs=_AUTOTUNE_CONFIGS, warmup=3, rep=10)
 @tilelang.jit(out_idx=[-2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
+def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV=64, threads=128, num_stages=2):
     """结合律版: W@S = A@(βγK@S), 不物化 W。寄存器少, 短序列快。"""
     block_S = CHUNK_SIZE
     num_chunks = (S + block_S - 1) // block_S
@@ -196,8 +209,9 @@ def _gdn_naive_kernel(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
 # ============================================================
 # 物化 W 版 (长序列): 直接 W=A@βγK 再 W@S, GEMM 数少, 长序列快
 # ============================================================
+@autotune(configs=_AUTOTUNE_CONFIGS, warmup=3, rep=10)
 @tilelang.jit(out_idx=[-2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV, threads, num_stages):
+def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=64, threads=128, num_stages=2):
     """物化 W 版: W=A@βγK 驻 shared, W@S 直接算。GEMM 少, 长序列快。"""
     block_S = CHUNK_SIZE
     num_chunks = (S + block_S - 1) // block_S
@@ -366,7 +380,7 @@ def gdn_prefill_forward(
     A: torch.Tensor,
     initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """GDN prefill 前向 (per-case 分发: 短序列用结合律版, 长序列用物化W版)。"""
+    """GDN prefill 前向 (per-case 分发 + autotune 自动选参)。"""
     batch_size, num_tokens, num_heads_qk, head_dim_k = q.shape
     _, _, num_heads_v, head_dim_v = v.shape
 
@@ -376,23 +390,16 @@ def gdn_prefill_forward(
             dtype=torch.float32, device=q.device,
         )
 
-    threads = 128
-    num_stages = 2
-
-    # per-case 分发 (实测依据, H800 MIG 10G):
-    #   短序列 (T<=2048): 结合律版 block_DV=64, 寄存器少, launch 开销占比大, 受益
-    #   长序列 (T>2048): 物化W版 block_DV=64, GEMM 数少 (32 会令 TC 效率下降)
+    # autotune 会自动搜 block_DV/threads/num_stages, 只传形状参数
     if num_tokens <= 2048:
-        block_DV = 64
         kernel = _gdn_naive_kernel(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
-            head_dim_k, head_dim_v, block_DV, threads, num_stages,
+            head_dim_k, head_dim_v,
         )
     else:
-        block_DV = 64
         kernel = _gdn_naive_kernel_matw(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
-            head_dim_k, head_dim_v, block_DV, threads, num_stages,
+            head_dim_k, head_dim_v,
         )
     output, final_state = kernel(q, k, v, g_cumsum, beta, A, initial_state)
     return output, final_state
