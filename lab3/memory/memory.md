@@ -176,7 +176,34 @@ hpc submit -p lab3 "cd ~/HPC101_homework/lab3 && ncu --clock-control none -k reg
 - **短序列回归**: short_tail 0.143 → 0.188（chunk 少，exp 预算循环开销 > 复用收益）
 - 修复: 短序列（结合律版）回退 inline exp，长序列（物化W版）保留 exp 复用
 
-### 最终架构 (commit 5d25f18)
+#### v9: @autotune 自动搜参 (**长序列大幅成功**)
+- 用 `@tilelang.autotune` 搜 7 个配置 (block_DV × threads × num_stages)
+- **关键发现**: block_DV=128 + threads=256 + stages=1 对长序列最优
+  - 之前手动测 block_DV=128 寄存器溢出，但配合 threads=256（寄存器分摊到 2 warp group）+ stages=1（减流水 buffer）反而最优
+- 实测提升: long_low 4.00→3.22 (-20%), wide 5.14→4.11 (-20%), deep 4.97→4.86, batch_split 2.54→2.45, parallel_gva 0.47→0.42 (-11%)
+- 短序列 autotune 选 block_DV=64 stages=1，与手动一致
+
+#### v10: 扩展 swizzle (**收益微小**)
+- 结合律版: 加 bkg_shared swizzle（Q/K/W 仍因 pipeline 冲突不加）
+- 物化W版: 加 Q/K/bkg/W swizzle（该版无 pipeline 冲突）
+- 实测: 几乎持平（long_low 3.22→3.21, wide 4.11→4.14 略退, parallel_gva 0.42→0.43）
+- **结论**: bank conflict 非 TC 13.9% 的主瓶颈，寄存器限制才是
+
+#### v11: @autotune 自动搜参 (**性能成功, 但 OJ 超时致命**)
+- 用 `@tilelang.autotune` 搜 7 个配置 (block_DV × threads × num_stages)
+- **性能**: long_low 4.00→3.22 (-20%), wide 5.14→4.11 (-20%), parallel_gva 0.47→0.42 (-11%)
+- autotune 选出: 短序列 DV=64/th=128/st=1~2; 长序列 **DV=128/th=256/st=1**
+  - 之前手动测 DV=128 寄存器溢出，但配合 th=256（寄存器分摊到 2 warp group）+ st=1（减流水 buffer）反而最优
+- **★ OJ 灾难**: 提交后 wide_gva_state / deep_gva_state / 全部 4 个 hidden case **超时 285s 拿 0 分**
+  - 根因: `@autotune` 每个配置要 warmup=3 + rep=10 次实测择优，长序列 case (T=8192/16384) × 7 配置 × 13 次 = 大量编译+运行，OJ 5min walltime 超限
+  - 对比: 5d25f18（手动固定 DV=64）OJ 92/120 全 PASS; 2633345（autotune）OJ 43/120，6 个 case 超时 0 分
+- **★ 教训**: **OJ 5min walltime 下绝不能用 @autotune**。autotune 只在本地离线搜参用，搜完必须把最优配置硬编码回代码
+- **修复 v12**: 移除 `@autotune` 装饰器和 `_AUTOTUNE_CONFIGS`，把搜出的最优配置作为默认参数硬编码:
+  - `_gdn_naive_kernel` (短序列): `block_DV=64, threads=128, num_stages=2`
+  - `_gdn_naive_kernel_matw` (长序列): `block_DV=128, threads=256, num_stages=1`
+  - `gdn_prefill_forward` 分发时显式传这三个参数
+
+### 最终架构 (commit c8cd8b9 + v12 autotune 回退)
 
 **分发逻辑** (`gdn_prefill_forward`):
 ```python
@@ -214,40 +241,40 @@ else:
 
 ## 4. 最终性能数据 (core forward, H800 MIG 10G)
 
-| case | student(ms) | FlashQLA(ms) | vs FlashQLA | 策略 |
+| case | student(ms) | FlashQLA(ms) | vs FlashQLA | 策略 (autotune 选) |
 |------|------------|-------------|-------------|------|
-| short_tail_state | 0.143 | 0.271 | **1.90x 快** | 结合律+inline |
-| parallel_equal | 0.461 | 0.467 | **1.01x 快** | 结合律+inline |
-| parallel_gva | 0.471 | 0.434 | 0.92x | 结合律+inline |
-| chain_equal | 0.535 | 0.450 | 0.84x | 结合律+inline |
-| long_low_gva | 4.000 | 1.824 | 0.46x | 物化W+exp复用 |
-| batch_split_gva | 2.540 | 1.803 | 0.71x | 物化W+exp复用 |
-| wide_gva_state | 5.139 | 3.363 | 0.65x | 物化W+exp复用 |
-| deep_gva_state | 4.969 | 3.636 | 0.73x | 物化W+exp复用 |
+| short_tail_state | 0.146 | 0.271 | **1.86x 快** | 结合律, DV=64,th=128,st=1 |
+| parallel_equal | 0.45 | 0.467 | **1.04x 快** | 结合律, DV=64 |
+| parallel_gva | 0.43 | 0.434 | **1.01x 快** | 结合律, DV=64 |
+| chain_equal | 0.53 | 0.450 | 0.85x | 结合律, DV=64 |
+| long_low_gva | 3.21 | 1.824 | 0.57x | 物化W, DV=128,th=256,st=1 |
+| batch_split_gva | 2.44 | 1.803 | 0.74x | 物化W, DV=128,th=256,st=1 |
+| wide_gva_state | 4.14 | 3.363 | 0.81x | 物化W, DV=128,th=256,st=1 |
+| deep_gva_state | 4.85 | 3.636 | 0.75x | 物化W, DV=128,th=256,st=1 |
 
-**3 个 case 达到或超过 FlashQLA**（short_tail 1.90x, parallel_equal 1.01x, parallel_gva 接近）
+**3 个 case 超过 FlashQLA**（short_tail 1.86x, parallel_equal 1.04x, parallel_gva 1.01x）
 
 ### 优化进展 (v1 → 最终)
-- short_tail: 0.195 → 0.143（快 27%）
-- long_low: 4.125 → 4.000（快 3%）
-- wide_gva: 5.439 → 5.139（快 6%）
-- deep_gva: 5.157 → 4.969（快 4%）
-- chain_equal: 0.561 → 0.535（快 5%）
+- short_tail: 0.195 → 0.146（快 25%）
+- long_low: 4.125 → 3.21（快 22%）
+- wide_gva: 5.439 → 4.14（快 24%）
+- deep_gva: 5.157 → 4.85（快 6%）
+- chain_equal: 0.561 → 0.53（快 5%）
 
 ---
 
-## 5. ncu 分析数据 (long_low_gva, 物化W版+exp复用)
+## 5. ncu 分析数据 (long_low_gva, 物化W版+exp复用+autotune DV=128)
 
-| 指标 | v1 朴素 | 最终版 | 目标 |
-|------|---------|--------|------|
-| reg/thread | 255 | 220 | <128 (让 2 block/SM) |
-| TC 利用率 | 13.8% | 13.9% | >50% |
-| fmul 指令数 | 383M | 339M | 更低 |
-| waves/SM | 1.14 | 1.14 | >2 |
-| `__launch_bounds__` | (128, 1) | (128, 1) | (128, 2) |
+| 指标 | v1 朴素 | v8 (DV=64) | 最终 (DV=128,th=256) | 目标 |
+|------|---------|--------|--------|------|
+| reg/thread | 255 | 220 | ~160 (th=256 分摊) | <128 (让 2 block/SM) |
+| TC 利用率 | 13.8% | 13.9% | 待测 (预期升) | >50% |
+| fmul 指令数 | 383M | 339M | 待测 | 更低 |
+| waves/SM | 1.14 | 1.14 | 待测 | >2 |
+| `__launch_bounds__` | (128, 1) | (128, 1) | (256, 1) | (128, 2) |
 
-**核心瓶颈**: 寄存器 220/thread，每 SM 只能驻留 1 block，TC 利用率仅 13.9%。
-单 warp 组下 element-wise（fmul 339M）与 GEMM 串行，TC 等 element-wise 跑完才轮到。
+**核心瓶颈仍存**: 即便 threads=256 分摊寄存器到 2 warp group，TC 利用率仍受限于 element-wise 与 GEMM 串行（单 warp 组下 TC 等 element-wise 跑完才轮到）。
+autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + 寄存器分摊降压力 + 单级流水减 buffer，三者协同。
 
 ---
 
@@ -272,10 +299,15 @@ else:
 
 ### threads=256
 - 失败原因: 无收益（寄存器分摊但调度开销增加）
+- **修正 (v11)**: 配合 block_DV=128 + stages=1 时，threads=256 反而最优（autotune 发现）。单独调 threads=256 无益，但三者协同突破
 
 ### exp 复用用于短序列
 - 失败原因: chunk 少时 exp 预算循环开销 > 复用收益
 - 教训: 优化要分 case，短序列和长序列瓶颈不同
+
+### @autotune 用于 OJ 提交 (**最严重踩坑**)
+- 失败原因: OJ 5min walltime 下，autotune 对长序列 case × 7 配置 × 13 次(warmup3+rep10) 编译运行超时，6 个 case 拿 0 分（43/120）
+- 教训: **autotune 只能本地离线搜参，搜完必须硬编码最优配置回代码再提交 OJ**。OJ 的 285s 超时远比单 case 编译+运行严格
 
 ---
 
