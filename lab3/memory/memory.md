@@ -309,6 +309,38 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - 失败原因: OJ 5min walltime 下，autotune 对长序列 case × 7 配置 × 13 次(warmup3+rep10) 编译运行超时，6 个 case 拿 0 分（43/120）
 - 教训: **autotune 只能本地离线搜参，搜完必须硬编码最优配置回代码再提交 OJ**。OJ 的 285s 超时远比单 case 编译+运行严格
 
+### Warp specialization 探针 (Phase A, 进行中)
+- 目标: 用 2-WG producer/consumer 验证 TileLang warp-spec API 在 MIG 上可用，为 4-WG 铺路
+- 调试开关: `GDN_WS_PROBE=1` 环境变量，`gdn_prefill_forward` 分发到 `_gdn_ws_probe_kernel`；默认走老 kernel 保 92 分基线
+- **★ 核心教训 1: T.Parallel element-wise store 对 wgmma async proxy 不可见 → NaN**
+  - producer 用 `T.Parallel` 写 shared，consumer 用 `T.gemm`(wgmma) 读 → 读到脏数据/未定义值 → NaN
+  - `T.fence_proxy_async()` **不够**（wgmma 异步代理仍看不到 T.Parallel 的常规 store）
+  - 修复: load 改用 `T.copy`（走 TMA 路径，TMA 的 shared 写天然对 async proxy 可见）
+  - g/beta 标量例外: consumer 用 `T.Parallel`(非 wgmma) 读，故 producer `T.Parallel` store + `fence_proxy_async` 即可
+- **★ 核心教训 2: mbarrier parity 语义 (照抄官方 example_warp_specialize_gemm_barrierpipe_stage2)**
+  - `wait_parity(p)` 阻塞直到 phase parity != p（不是 ==）。init phase=0，arrive 满 arrive_count 次后翻转 0→1→0
+  - 双 buffer (num_stages=2) barrier 布局: `mbars = T.alloc_barrier([128,128]*2)` → 4 个实例
+    - `[0,1]`=data_is_ready (producer→consumer), `[2,3]`=data_is_free (consumer→producer)
+  - 公式 (buf = i_c % num_stages):
+    - producer wait `mbars[buf + num_stages], ((i_c//num_stages)%num_stages)^1`
+    - consumer wait `mbars[buf], (i_c//num_stages)%num_stages`
+  - arrive_count=128 (一个 warp group 的 128 threads 都 arrive)
+- **★ 核心教训 3: T.use_swizzle(10) 在 warp-spec 下不要用**
+  - 官方 warp_specialize 示例均不用 `T.use_swizzle`。它干扰 mbarrier 代码生成
+  - bank-conflict 优化改用 `T.annotate_layout({buf: make_swizzled_layout(buf)})`
+- **★ 核心教训 4: threads 必须 ≥ 256 才有 2 个 warp group**
+  - `T.ws(0)` = [0,128), `T.ws(1)` = [128,256)。threads=128 只有 1 个 wg，ws(1) 无线程执行 → 死锁
+- **★ 核心教训 5: 尾块 T.copy 动态切片问题**
+  - `T.copy(Q[bb, left:last, ...], Q_shared[buf, 0:last-left, :])` 用运行时动态长度切片
+  - 无尾块 case (chain_equal/parallel_equal/long_low) 全 PASS
+  - 有尾块 case (short_tail T=1025, 尾块1 token) FAIL: NaN @ index 64 (尾块起点)
+  - 推测: TileLang T.copy 不支持运行时动态切片长度，或切片后 shared 未覆盖部分读到垃圾
+  - 待修: 尾块改用固定 block_S 切片 + 越界 mask，或对最后一个 chunk 特殊处理
+- **探针性能 (2-WG, 未优化, 仅验证)**:
+  - chain_equal 1.16ms (基线 0.53ms, 慢 2x — 预期, 2-WG 没藏 element-wise, 仅验证 API)
+  - long_low 4.56ms (基线 3.21ms, 慢 — 同理)
+  - 性能不是探针目标，Phase B 4-WG 才追求性能
+
 ---
 
 ## 7. 下一步优化方向 (未实现)
