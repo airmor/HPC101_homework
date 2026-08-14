@@ -354,6 +354,33 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - **结论**: 2-WG 止步于此 (已验证 API + 数学正确), 性能没提升是 2-WG 结构局限而非实现错误
 - **回退**: 代码回退到 Phase A 探针版 (f7b5cdb), Phase B 失败改动丢弃; 默认走 matw 版 (OJ 92 分基线安全)
 
+### Phase B: 4-WG warp specialization (**死锁, 未通过**)
+- 尝试: 4-WG (threads=512), FlashQLA 数学形式
+  - CONSUMER_S [0,128): h*=γr; h+=Kᵀ@V'; 发布 h_shared(S_old)
+  - CONSUMER_V [128,256): U=K@S; W=V−g⊙U; Vd=A@W; V'=ratio⊙Vd; 发布 vn_shared
+  - CONSUMER_O [256,384): P=Q@Kᵀ; G; O=Q@S; O+=(scale·G⊙P)@V'
+  - PRODUCER [384,512): load + ew g_exp/g_inv
+- barrier: data_is_ready[2](128), data_is_free[2](384), h_ready[2](128), vn_ready[2](128)
+- **结果**: chain_equal 编译通过但运行死锁 (walltime timeout, 无 PASS/FAIL)
+- **★ 踩坑 1: T.gemm 要求操作数同 dtype**
+  - `T.gemm(p_fragment, vn_shared, ...)` 中 p_fragment 是 FP32, vn_shared 是 BF16 → "A and B must have the same dtype"
+  - 修复: 加 `p_shared = T.alloc_shared(BF16)`, `T.copy(p_fragment, p_shared)` 再 gemm
+- **★ 踩坑 2: mbarrier parity 公式必须用 (i_c//num_stages)%num_stages, 不是 i_c%2**
+  - 错误 `parity = i_c % 2`: chunk1 buf=1 wait(ready[1], 1), init0, 0!=1 提前返回读脏数据
+  - 正确 `parity = (i_c//2)%2`: chunk0=0, chunk1=0, chunk2=1, 每个 barrier 实例服务 2 chunk 才翻转
+- **★ 踩坑 3: data_is_free 必须双 buffer, 不能单实例**
+  - 单实例 data_is_free[0]: chunk1 producer wait(free[0]) 等 chunk1 consumer arrive, 但 consumer 等 ready[1] (producer 还没 arrive) → 循环死锁
+  - 修复: data_is_free[2] 双 buffer, chunk1 buf=1 用 data_is_free[1]
+- **★ 踩坑 4 (致命, 未解决): T.ws(3) 疑似在 TileLang 不支持或行为异常**
+  - 官方示例只用 ws(0)/ws(1); FlashMLA 用 `if tx<128 else` 手写
+  - ws(2)/ws(3) 下 kernel 编译通过但运行死锁, 无法确定是 ws(3) 问题还是 barrier 时序
+  - 修复方向: 改用 `tx = T.get_thread_binding()` + `if tx<128/elif/<256/elif/<384/else` 手写 4 分支 (flashmla 风格)
+- **结论**: 4-WG 在 TileLang 上的 barrier handshake 极易死锁, 调试成本高 (远程 5min walltime)
+  - 已验证: barrier 语义、parity 公式、双 buffer 必要性、dtype 要求
+  - 未解决: ws(3) 支持性 / 完整 4 分支死锁定位
+  - **回退**: 代码回退到 Phase A 探针版 (f7b5cdb), 4-WG 代码丢弃; 默认走 matw 版 (OJ 92 分基线安全)
+  - 下次若重试 4-WG: 用 `tx = T.get_thread_binding()` 手写 4 分支替代 T.ws(3)
+
 ---
 
 ## 7. 下一步优化方向
