@@ -341,11 +341,32 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
   - long_low 4.56ms (基线 3.21ms, 慢 — 同理)
   - 性能不是探针目标，Phase B 4-WG 才追求性能
 
+### Phase B: 2-WG element-wise 搬移 (**无收益, 结构局限**)
+- 尝试: 把 βγK/βV/g_exp/g_inv/beta_g 从 consumer 搬到 producer (ws1), 期望藏进 consumer GEMM 周期
+- 实测: chain_equal 1.16→1.22ms (持平), long_low 4.56→4.90ms (略慢)
+- **★ 根因: 2-WG 在 GDN 上做不到 element-wise 藏进 GEMM**
+  - GDN 的 element-wise 产物 (βγK/βV) 恰是 consumer 第一个 GEMM (W=A@bkg, U=A@bv) 的操作数
+  - 时序上 element-wise 卡在 consumer 启动前, 无法重叠
+  - 双 ready barrier (input_ready + ew_ready) 只能让 QKᵀ(1/7 GEMM, 不依赖 ew) 与 producer ew 重叠, 收益太小
+- **★ FlashQLA 能藏 element-wise 的真正机制: 4-WG 让 3 个 consumer 并行跑不同 GEMM**
+  - S/V/O 各一个 consumer 并行 GEMM, producer 的 ew 藏进"其他 consumer 正在跑 GEMM"的周期
+  - 不是藏进"同一个 consumer 的下一个 GEMM" (2-WG 的错误假设)
+- **结论**: 2-WG 止步于此 (已验证 API + 数学正确), 性能没提升是 2-WG 结构局限而非实现错误
+- **回退**: 代码回退到 Phase A 探针版 (f7b5cdb), Phase B 失败改动丢弃; 默认走 matw 版 (OJ 92 分基线安全)
+
 ---
 
-## 7. 下一步优化方向 (未实现)
+## 7. 下一步优化方向
 
-### warp specialization (最大潜力, 实现复杂度最高)
+### 目标: OJ 110 分
+
+当前 ~92-95 分 (95ba1d4 回退 autotune 后)。110 分需要长序列 4 case 平均 ~113 分 (p≈1.4, 即比 FlashQLA 快 40%)。
+- long_low: 3.21ms → 需 ~1.33ms (2.4x 加速)
+- wide: 4.14ms → 需 ~1.73ms (2.4x)
+- deep: 4.85ms → 需 ~2.02ms (2.4x)
+这非常激进, 4-WG 单独可能不够 (预期 1.5-2x), 需配合数学变换。
+
+### warp specialization 4-WG (最大潜力, 实现复杂度最高)
 - 思路: 手写 4 warp 组（producer/S/V/O consumer），element-wise 藏进 GEMM 执行周期
 - 基线 FlashQLA 即此结构（4 warp group + mbarrier + TMA + ping-pong）
 - TileLang 无原语支持外层递推的 warp spec，必须手写 `tx = T.get_thread_binding()` + `if tx < N` 分支 + prologue/main/epilogue + mbarrier parity
