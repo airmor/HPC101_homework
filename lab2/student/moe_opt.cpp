@@ -887,6 +887,9 @@ static void expert_ffn_batch(
     }
 }
 
+// S1's single-token path uses this function.  V7 integration (from
+// lab2_s1_scratch): 4×K unroll with 4 independent accumulator chains per
+// projection + broadcastd+shuffle xq load.
 static void expert_ffn(const uint8_t* __restrict w_gate,
                        const uint8_t* __restrict w_up,
                        const uint8_t* __restrict w_down,
@@ -906,23 +909,35 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
     // reuses the same 4-byte xq broadcast for both projections, so loading
     // xq once (already done per k) and issuing back-to-back dpbusd lets the
     // two independent accumulators pipeline on the VNNI ports.
+    //
+    // V7 integration (from lab2_s1_scratch): load 4 K-groups (16 bytes) in one
+    // __m128i and broadcast each 4-byte lane via broadcastd+shuffle, instead
+    // of memcpy+set1 which materializes x4[4] on the stack.  The 4 sub-
+    // accumulators start at zero and the +128 correction is applied once to
+    // the reduced sum (not per sub-accumulator, which would 4× the correction).
     const int k_groups = d_model / 4;
+    const int k_groups4 = k_groups / 4 * 4;
     for (int f = 0; f < d_ff; f += 16) {
-        __m512i gate_acc = x_correction;
-        __m512i up_acc = x_correction;
+        __m512i gate_acc0 = _mm512_setzero_si512();
+        __m512i gate_acc1 = _mm512_setzero_si512();
+        __m512i gate_acc2 = _mm512_setzero_si512();
+        __m512i gate_acc3 = _mm512_setzero_si512();
+        __m512i up_acc0 = _mm512_setzero_si512();
+        __m512i up_acc1 = _mm512_setzero_si512();
+        __m512i up_acc2 = _mm512_setzero_si512();
+        __m512i up_acc3 = _mm512_setzero_si512();
         const size_t f_offset = static_cast<size_t>(f) * d_model;
-        // Unroll the K reduction by 4 to expose more independent dpbusd
-        // ops (8 acc chains per unroll body) so the VNNI ports and the load
-        // ports overlap while the accumulator dependency chain stays short
-        // relative to the pipeline depth.
         int k = 0;
-        for (; k + 3 < k_groups; k += 4) {
-            uint32_t x4[4];
-            std::memcpy(x4, xq + k * 4, sizeof(x4));
-            const __m512i xa = _mm512_set1_epi32(static_cast<int32_t>(x4[0]));
-            const __m512i xb = _mm512_set1_epi32(static_cast<int32_t>(x4[1]));
-            const __m512i xc = _mm512_set1_epi32(static_cast<int32_t>(x4[2]));
-            const __m512i xd = _mm512_set1_epi32(static_cast<int32_t>(x4[3]));
+        for (; k < k_groups4; k += 4) {
+            __m128i x4v;
+            std::memcpy(&x4v, xq + k * 4, sizeof(__m128i));
+            const __m512i xa = _mm512_broadcastd_epi32(x4v);
+            const __m512i xb = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(x4v, _MM_SHUFFLE(1, 1, 1, 1)));
+            const __m512i xc = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(x4v, _MM_SHUFFLE(2, 2, 2, 2)));
+            const __m512i xd = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(x4v, _MM_SHUFFLE(3, 3, 3, 3)));
             const size_t o0 = static_cast<size_t>(k) * 64;
             const size_t o1 = static_cast<size_t>(k + 1) * 64;
             const size_t o2 = static_cast<size_t>(k + 2) * 64;
@@ -935,15 +950,21 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
             const __m512i wu1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o1));
             const __m512i wu2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o2));
             const __m512i wu3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_up + f_offset + o3));
-            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg0, xa);
-            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu0, xa);
-            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg1, xb);
-            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu1, xb);
-            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg2, xc);
-            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu2, xc);
-            gate_acc = _mm512_dpbusd_epi32(gate_acc, wg3, xd);
-            up_acc   = _mm512_dpbusd_epi32(up_acc,   wu3, xd);
+            gate_acc0 = _mm512_dpbusd_epi32(gate_acc0, wg0, xa);
+            up_acc0   = _mm512_dpbusd_epi32(up_acc0,   wu0, xa);
+            gate_acc1 = _mm512_dpbusd_epi32(gate_acc1, wg1, xb);
+            up_acc1   = _mm512_dpbusd_epi32(up_acc1,   wu1, xb);
+            gate_acc2 = _mm512_dpbusd_epi32(gate_acc2, wg2, xc);
+            up_acc2   = _mm512_dpbusd_epi32(up_acc2,   wu2, xc);
+            gate_acc3 = _mm512_dpbusd_epi32(gate_acc3, wg3, xd);
+            up_acc3   = _mm512_dpbusd_epi32(up_acc3,   wu3, xd);
         }
+        __m512i gate_acc = _mm512_add_epi32(_mm512_add_epi32(gate_acc0, gate_acc1),
+                                            _mm512_add_epi32(gate_acc2, gate_acc3));
+        __m512i up_acc = _mm512_add_epi32(_mm512_add_epi32(up_acc0, up_acc1),
+                                          _mm512_add_epi32(up_acc2, up_acc3));
+        gate_acc = _mm512_add_epi32(gate_acc, x_correction);
+        up_acc = _mm512_add_epi32(up_acc, x_correction);
         for (; k < k_groups; ++k) {
             uint32_t x4;
             std::memcpy(&x4, xq + k * 4, sizeof(x4));
@@ -981,19 +1002,27 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
     const __m512i h_correction = _mm512_set1_epi32(-128 * hq_sum);
     const __m512 down_scale = _mm512_set1_ps(s_h * s_down);
     const int f_groups = d_ff / 4;
-    // The down projection's K dimension is d_ff.  Unrolling by 4 keeps the
-    // VNNI ports fed with independent acc chains, matching the gate/up loop.
+    const int f_groups4 = f_groups / 4 * 4;
+    // The down projection's K dimension is d_ff.  V7: 4 independent accumulator
+    // chains with broadcastd+shuffle load, matching the gate/up loop.  The +128
+    // correction is applied once to the reduced sum.
     for (int d = 0; d < d_model; d += 16) {
-        __m512i acc = h_correction;
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512();
+        __m512i acc3 = _mm512_setzero_si512();
         const size_t d_offset = static_cast<size_t>(d) * d_ff;
         int g = 0;
-        for (; g + 3 < f_groups; g += 4) {
-            uint32_t hq4[4];
-            std::memcpy(hq4, hq + g * 4, sizeof(hq4));
-            const __m512i qa = _mm512_set1_epi32(static_cast<int32_t>(hq4[0]));
-            const __m512i qb = _mm512_set1_epi32(static_cast<int32_t>(hq4[1]));
-            const __m512i qc = _mm512_set1_epi32(static_cast<int32_t>(hq4[2]));
-            const __m512i qd = _mm512_set1_epi32(static_cast<int32_t>(hq4[3]));
+        for (; g < f_groups4; g += 4) {
+            __m128i hq4v;
+            std::memcpy(&hq4v, hq + g * 4, sizeof(__m128i));
+            const __m512i qa = _mm512_broadcastd_epi32(hq4v);
+            const __m512i qb = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(hq4v, _MM_SHUFFLE(1, 1, 1, 1)));
+            const __m512i qc = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(hq4v, _MM_SHUFFLE(2, 2, 2, 2)));
+            const __m512i qd = _mm512_broadcastd_epi32(
+                _mm_shuffle_epi32(hq4v, _MM_SHUFFLE(3, 3, 3, 3)));
             const size_t o0 = static_cast<size_t>(g) * 64;
             const size_t o1 = static_cast<size_t>(g + 1) * 64;
             const size_t o2 = static_cast<size_t>(g + 2) * 64;
@@ -1002,11 +1031,14 @@ static void expert_ffn(const uint8_t* __restrict w_gate,
             const __m512i w1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o1));
             const __m512i w2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o2));
             const __m512i w3 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(w_down + d_offset + o3));
-            acc = _mm512_dpbusd_epi32(acc, w0, qa);
-            acc = _mm512_dpbusd_epi32(acc, w1, qb);
-            acc = _mm512_dpbusd_epi32(acc, w2, qc);
-            acc = _mm512_dpbusd_epi32(acc, w3, qd);
+            acc0 = _mm512_dpbusd_epi32(acc0, w0, qa);
+            acc1 = _mm512_dpbusd_epi32(acc1, w1, qb);
+            acc2 = _mm512_dpbusd_epi32(acc2, w2, qc);
+            acc3 = _mm512_dpbusd_epi32(acc3, w3, qd);
         }
+        __m512i acc = _mm512_add_epi32(_mm512_add_epi32(acc0, acc1),
+                                       _mm512_add_epi32(acc2, acc3));
+        acc = _mm512_add_epi32(acc, h_correction);
         for (; g < f_groups; ++g) {
             uint32_t hq4;
             std::memcpy(&hq4, hq + g * 4, sizeof(hq4));
@@ -1429,20 +1461,25 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             }
         } else {
             // Existing fp32 router path retained for S1/S2/S3.
-            for (int e = 0; e < g_router_padded_experts; e += 16) {
-                __m512 acc = _mm512_setzero_ps();
-                const float* const router_block =
-                    w_router_transpose + static_cast<size_t>(e) * d_model;
-                for (int d = 0; d < d_model; ++d) {
-                    acc = _mm512_fmadd_ps(
-                        _mm512_loadu_ps(router_block + static_cast<size_t>(d) * 16),
-                        _mm512_set1_ps(xt[d]), acc);
+            // V7 integration (from lab2_s1_scratch): process each expert's
+            // logit as a direct fp32 GEMV (W_router[e] · x), loading x in
+            // 16-wide ZMM chunks with 2 accumulators.  The old path loaded
+            // the transposed router (w_router_transpose) one element at a time
+            // via set1_ps(xt[d]) — 256 scalar broadcasts per expert vs 8
+            // vector loads here.  Same numerics (fp32 dot → sigmoid).
+            for (int e = 0; e < num_experts; ++e) {
+                const float* const router_row =
+                    w.w_router + static_cast<size_t>(e) * d_model;
+                __m512 acc0 = _mm512_setzero_ps();
+                __m512 acc1 = _mm512_setzero_ps();
+                for (int d = 0; d < d_model; d += 32) {
+                    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                           _mm512_loadu_ps(xt + d), acc0);
+                    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d + 16),
+                                           _mm512_loadu_ps(xt + d + 16), acc1);
                 }
-                const __m512 s = _mm512_div_ps(
-                    _mm512_set1_ps(1.0f),
-                    _mm512_add_ps(_mm512_set1_ps(1.0f),
-                                  exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc))));
-                _mm512_storeu_ps(scores + e, s);
+                const float logit = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+                scores[e] = 1.0f / (1.0f + expf(-logit));
             }
             bool used[MAX_NUM_EXPERTS] = {};
             for (int k = 0; k < top_k; ++k) {
