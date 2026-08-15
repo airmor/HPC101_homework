@@ -1208,17 +1208,21 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
 }
 
 // ==========================================================================
-// Shared stage 1: fp32 router + quantization + top-K (S1/S2/S3).
-// Extracted as a noinline helper so each scenario function is independent.
+// S1: N=1, D=256 — per-task expert_ffn with capped OpenMP team.
+// Self-contained: router+quant+combine inlined (no cross-call optimization
+// barrier), only expert_ffn is a separate function.  Matches the lab2_s1_scratch
+// s1_forward structure that measured 12.4× grading.
 // ==========================================================================
 __attribute__((noinline))
-static void stage1_fp32_router(const float* x, const MoEWeights& w, int num_tokens) {
+static void moe_forward_s1(const float* x, const MoEWeights& w, float* y, int num_tokens) {
     const int d_model = w.d_model;
     const int d_ff = w.d_ff;
     const int num_experts = w.num_experts;
     const int top_k = w.top_k;
+    const int slots = top_k + 1;
+    const int total_tasks = num_tokens * slots;
 
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    // --- Stage 1: fp32 router + quantization + top-K (inlined, serial for N=1) ---
     for (int t = 0; t < num_tokens; ++t) {
         const float* const xt = x + static_cast<size_t>(t) * d_model;
         float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
@@ -1273,56 +1277,8 @@ static void stage1_fp32_router(const float* x, const MoEWeights& w, int num_toke
         }
         gate_sum_workspace[t] = gate_sum;
     }
-}
 
-// ==========================================================================
-// Shared combine: y_t = x_t + o_shared + sum_k gate_k * o_k (all scenarios).
-// ==========================================================================
-__attribute__((noinline))
-static void combine_outputs(const float* x, const MoEWeights& w, float* y, int num_tokens) {
-    const int d_model = w.d_model;
-    const int top_k = w.top_k;
-    const int slots = top_k + 1;
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
-    for (int t = 0; t < num_tokens; ++t) {
-        const float* const xt = x + static_cast<size_t>(t) * d_model;
-        float* const yt = y + static_cast<size_t>(t) * d_model;
-        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
-        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
-        const float* const outs = expert_out_workspace +
-                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
-        const float* o_shared = outs;
-        __m512 gk[MAX_TOP_K];
-        for (int k = 0; k < top_k; ++k) {
-            const int e = topk_idx[k];
-            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
-        }
-        for (int d = 0; d < d_model; d += 16) {
-            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
-                                       _mm512_loadu_ps(o_shared + d));
-            for (int k = 0; k < top_k; ++k) {
-                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
-                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
-            }
-            _mm512_storeu_ps(yt + d, acc);
-        }
-    }
-}
-
-// ==========================================================================
-// S1: N=1, D=256 — per-task expert_ffn with capped OpenMP team.
-// ==========================================================================
-__attribute__((noinline))
-static void moe_forward_s1(const float* x, const MoEWeights& w, float* y, int num_tokens) {
-    const int d_model = w.d_model;
-    const int d_ff = w.d_ff;
-    const int top_k = w.top_k;
-    const int slots = top_k + 1;
-    const int total_tasks = num_tokens * slots;
-
-    stage1_fp32_router(x, w, num_tokens);
-
+    // --- Stage 2: per-task expert FFN ---
     const int ffn_threads_cap = (total_tasks < 64) ? total_tasks : 16;
 #pragma omp parallel for if (total_tasks >= 2) schedule(static) num_threads(ffn_threads_cap)
     for (int task = 0; task < total_tasks; ++task) {
@@ -1353,16 +1309,42 @@ static void moe_forward_s1(const float* x, const MoEWeights& w, float* y, int nu
         }
     }
 
-    combine_outputs(x, w, y, num_tokens);
+    // --- Stage 3: combine (inlined) ---
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+        const float* o_shared = outs;
+        __m512 gk[MAX_TOP_K];
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            }
+            _mm512_storeu_ps(yt + d, acc);
+        }
+    }
 }
 
 // ==========================================================================
 // S2: N=1, D=1024 — intra-FFN thread splitting (large d_model).
+// Self-contained: router+quant+combine inlined.
 // ==========================================================================
 __attribute__((noinline))
 static void moe_forward_s2(const float* x, const MoEWeights& w, float* y, int num_tokens) {
     const int d_model = w.d_model;
     const int d_ff = w.d_ff;
+    const int num_experts = w.num_experts;
     const int top_k = w.top_k;
     const int slots = top_k + 1;
     const int total_tasks = num_tokens * slots;
@@ -1371,8 +1353,59 @@ static void moe_forward_s2(const float* x, const MoEWeights& w, float* y, int nu
     const int fblock_tasks = total_tasks * n_fblocks;
     const int dblock_tasks = total_tasks * n_dblocks;
 
-    stage1_fp32_router(x, w, num_tokens);
+    // --- Stage 1: fp32 router + quantization + top-K (inlined, serial for N=1) ---
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+        __m512 x_amax_vec = _mm512_setzero_ps();
+        for (int d = 0; d < d_model; d += 16) {
+            x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
+        }
+        const float x_amax = _mm512_reduce_max_ps(x_amax_vec);
+        const float s_x = x_amax > 0.0f ? x_amax / 127.0f : 1.0f;
+        x_scale_workspace[t] = s_x;
+        const __m512 inv_s_x = _mm512_set1_ps(x_amax > 0.0f ? 127.0f / x_amax : 1.0f);
+        for (int d = 0; d < d_model; d += 16) {
+            const __m512i q = _mm512_cvt_roundps_epi32(
+                _mm512_mul_ps(_mm512_loadu_ps(xt + d), inv_s_x),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
+                             _mm512_cvtsepi32_epi8(q));
+        }
+        x_sum_workspace[t] = sum_int8(xq, d_model);
+        int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        float gate_sum = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            const float* const router_row = w.w_router + static_cast<size_t>(e) * d_model;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            for (int d = 0; d < d_model; d += 32) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                       _mm512_loadu_ps(xt + d), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d + 16),
+                                       _mm512_loadu_ps(xt + d + 16), acc1);
+            }
+            const float logit = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+            scores[e] = 1.0f / (1.0f + expf(-logit));
+        }
+        bool used[MAX_NUM_EXPERTS] = {};
+        for (int k = 0; k < top_k; ++k) {
+            int best = -1;
+            for (int e = 0; e < num_experts; ++e) {
+                if (!used[e] &&
+                    (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
+                    best = e;
+                }
+            }
+            used[best] = true;
+            topk_idx[k] = best;
+            gate_sum += scores[best];
+        }
+        gate_sum_workspace[t] = gate_sum;
+    }
 
+    // --- Stage 2: intra-FFN thread splitting ---
 #pragma omp parallel num_threads(16)
     {
 #pragma omp for schedule(static)
@@ -1459,7 +1492,31 @@ static void moe_forward_s2(const float* x, const MoEWeights& w, float* y, int nu
         }
     }
 
-    combine_outputs(x, w, y, num_tokens);
+    // --- Stage 3: combine (inlined) ---
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+        const float* o_shared = outs;
+        __m512 gk[MAX_TOP_K];
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            }
+            _mm512_storeu_ps(yt + d, acc);
+        }
+    }
 }
 
 // ==========================================================================
@@ -1473,7 +1530,58 @@ static void moe_forward_s3(const float* x, const MoEWeights& w, float* y, int nu
     const int top_k = w.top_k;
     const int slots = top_k + 1;
 
-    stage1_fp32_router(x, w, num_tokens);
+    // --- Stage 1: fp32 router + quantization + top-K (inlined, parallel for N>=4) ---
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+        __m512 x_amax_vec = _mm512_setzero_ps();
+        for (int d = 0; d < d_model; d += 16) {
+            x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
+        }
+        const float x_amax = _mm512_reduce_max_ps(x_amax_vec);
+        const float s_x = x_amax > 0.0f ? x_amax / 127.0f : 1.0f;
+        x_scale_workspace[t] = s_x;
+        const __m512 inv_s_x = _mm512_set1_ps(x_amax > 0.0f ? 127.0f / x_amax : 1.0f);
+        for (int d = 0; d < d_model; d += 16) {
+            const __m512i q = _mm512_cvt_roundps_epi32(
+                _mm512_mul_ps(_mm512_loadu_ps(xt + d), inv_s_x),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
+                             _mm512_cvtsepi32_epi8(q));
+        }
+        x_sum_workspace[t] = sum_int8(xq, d_model);
+        int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        float gate_sum = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            const float* const router_row = w.w_router + static_cast<size_t>(e) * d_model;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            for (int d = 0; d < d_model; d += 32) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                       _mm512_loadu_ps(xt + d), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d + 16),
+                                       _mm512_loadu_ps(xt + d + 16), acc1);
+            }
+            const float logit = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+            scores[e] = 1.0f / (1.0f + expf(-logit));
+        }
+        bool used[MAX_NUM_EXPERTS] = {};
+        for (int k = 0; k < top_k; ++k) {
+            int best = -1;
+            for (int e = 0; e < num_experts; ++e) {
+                if (!used[e] &&
+                    (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
+                    best = e;
+                }
+            }
+            used[best] = true;
+            topk_idx[k] = best;
+            gate_sum += scores[best];
+        }
+        gate_sum_workspace[t] = gate_sum;
+    }
 
     const int shared_bucket = num_experts;
     for (int e = 0; e <= num_experts + 1; ++e) expert_token_count[e] = 0;
@@ -1564,7 +1672,32 @@ static void moe_forward_s3(const float* x, const MoEWeights& w, float* y, int nu
                          B, d_model, d_ff);
     }
 
-    combine_outputs(x, w, y, num_tokens);
+    // --- Stage 3: combine (inlined) ---
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+        const float* o_shared = outs;
+        __m512 gk[MAX_TOP_K];
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            }
+            _mm512_storeu_ps(yt + d, acc);
+        }
+    }
 }
 
 // ==========================================================================
@@ -1792,5 +1925,30 @@ static void moe_forward_s4(const float* x, const MoEWeights& w, float* y, int nu
                          B, d_model, d_ff);
     }
 
-    combine_outputs(x, w, y, num_tokens);
+    // --- Stage 3: combine (inlined) ---
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+        const float* o_shared = outs;
+        __m512 gk[MAX_TOP_K];
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            }
+            _mm512_storeu_ps(yt + d, acc);
+        }
+    }
 }
