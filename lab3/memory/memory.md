@@ -381,6 +381,37 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
   - **回退**: 代码回退到 Phase A 探针版 (f7b5cdb), 4-WG 代码丢弃; 默认走 matw 版 (OJ 92 分基线安全)
   - 下次若重试 4-WG: 用 `tx = T.get_thread_binding()` 手写 4 分支替代 T.ws(3)
 
+### 4-WG tx 手写分支 (**barrier 调通, 卡 2.7% 精度**)
+- 用 `tx = T.get_thread_binding()` + `if tx<128/elif/<256/elif/<384/else` 手写 4 分支 (flashmla 风格)
+- **调通过程** (8 轮集群迭代):
+  1. `U=K@S` 错用 `transpose_B=True` → 去掉 (59.6% mismatch)
+  2. `W` 缺 `β` 因子 → `W=β(V−γU)` (56.4%)
+  3. O 用 `V'`(γr/γ·v_new) 应改用 `Vd`(=v_new) → 分离 vd/vn 双 buffer (2.7%)
+  4. matw 数学 (A@βγK 物化) 替代 FlashQLA 数学 → 仍 2.7% (非数学形式问题)
+  5. `TL_DISABLE_WGMMA=True` pass_config → 仍 2.7% (非 wgmma 问题)
+- **★ 2.7% 根因定位**: matw+T.serial 单 kernel **PASS** (0.886ms), 4-WG 同数学 FAIL
+  - 误差来自多 WG 同步, 非 T.serial / wgmma / 数学形式
+  - 推测: 跨 WG `T.copy(fragment, shared)` + `fence_proxy_async` 对 threads=512 的 async proxy 可见性不足
+  - 与 Phase A 教训 1 一致 (T.Parallel store 对 wgmma 不可见→NaN), 4-WG 下是部分可见→2.7% 精度差
+- **结论**: 4-WG 在 TileLang + MIG 上精度无法通过 RTOL=5e-3 (当前 TileLang 版本限制)
+- 回退到 f7b5cdb 基线
+
+### 长序列调参矩阵 (**DV=128/th=256/st=1 全局最优, 无提升空间**)
+| case | DV=128/th=256/st=1 | DV=64/th=256/st=1 | DV=64/th=128/st=2 | DV=128/th=512 |
+|------|---------------------|--------------------|--------------------|---------------|
+| long_low | 3.21ms (基线) | 4.98ms | 3.93ms | 精度回归 |
+| wide | 4.14ms (基线) | 6.37ms | - | FAIL |
+| deep | 4.85ms (基线) | 6.30ms | - | FAIL |
+| batch_split | 2.44ms (基线) | 3.08ms | - | - |
+- threads=512 → wide/deep FAIL (abs 0.025, wgmma 精度回归)
+- split-DV (DV=64) 全线更慢: grid 收益 < TC 效率损失 (v10 教训一致)
+- per-case 离线 autotune 硬编码 → 无提升 (DV=128 已最优)
+
+### chunk 间 state 并行 (**死路**)
+- GDN state 递推: `S[c] = (γr·I - sK^T@W)@S[c-1] + sK^T@U`, 需 [128,128] 矩阵 scan
+- WY v2 已证明 T=[128,128] 超 shared 上限, 走不通
+- FLA `chunk_h_parallel` 两阶段 (partial + scan) 不适用 GDN delta rule
+
 ---
 
 ## 7. 下一步优化方向
