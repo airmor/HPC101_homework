@@ -431,6 +431,8 @@ static void pack_amx_weights(const int8_t* src, uint8_t* dst,
 
 // Compute the shared FFN for up to 16 tokens.  Packing the activation once
 // lets gate and up share it, and AMX turns all three projections into GEMMs.
+// noinline+cold: isolates the large AMX body from S1's icache.
+__attribute__((noinline, cold))
 static void shared_expert_amx_batch(const float* __restrict x,
                                     float* __restrict y,
                                     const uint8_t* __restrict w_gate,
@@ -1139,6 +1141,13 @@ void preprocess(MoEWeights& w) {
     }
 }
 
+// Forward declarations of the four scenario-specific forward functions.
+// Each is noinline so its binary footprint is isolated from the others.
+__attribute__((noinline)) static void moe_forward_s1(const float* x, const MoEWeights& w, float* y, int num_tokens);
+__attribute__((noinline)) static void moe_forward_s2(const float* x, const MoEWeights& w, float* y, int num_tokens);
+__attribute__((noinline)) static void moe_forward_s3(const float* x, const MoEWeights& w, float* y, int num_tokens);
+__attribute__((noinline)) static void moe_forward_s4(const float* x, const MoEWeights& w, float* y, int num_tokens);
+
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
 #if USE_AMX && defined(__linux__)
@@ -1149,14 +1158,11 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const int num_experts = w.num_experts;
     const int top_k = w.top_k;
 
-    // IDEA-20260727-009: AMX batched router GEMM for S4 (large-N, E=512).
-    // The per-token VNNI router (one GEMV per token over 512 experts) is the
-    // S4 top hotspot (~33% CPU, VTune job 11254).  When N is large enough to
-    // fill a 16-token AMX tile AND d_model is a multiple of 64 (the AMX tile
-    // width), replace the per-token VNNI GEMV with a 16-token batched AMX GEMM
-    // that computes 16 experts x 16 tokens per _tile_dpbusd.  S1/S2 (N=1) and
-    // non-AMX builds keep the original per-token path (a single token wastes
-    // 15/16 of an AMX tile, same reasoning as the small-N FFN path).
+    // ======================================================================
+    // S4: large-N, E=512, AMX batched router + batched FFN.  Fully isolated
+    // from S1/S2/S3 via noinline+cold so its ~5KB of AMX code doesn't pollute
+    // the icache of the small-scenario paths (and vice versa).
+    // ======================================================================
 #if USE_AMX && defined(__linux__)
     const bool use_amx_router =
         (num_experts == MAX_NUM_EXPERTS) &&
@@ -1167,159 +1173,57 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
     const bool use_amx_router = false;
 #endif
     if (use_amx_router) {
-        // Quantize all tokens first (xq / s_x / x_sum), then run the batched
-        // AMX router GEMM, then per-token Top-M + FP32 rescore + Top-K.  The
-        // quantization loop mirrors the per-token block below so xq_workspace,
-        // x_scale_workspace and x_sum_workspace are populated identically.
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
-        for (int t = 0; t < num_tokens; ++t) {
-            const float* const xt = x + static_cast<size_t>(t) * d_model;
-            int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
-            __m512 x_amax_vec = _mm512_setzero_ps();            for (int d = 0; d < d_model; d += 16) {
-                x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
-            }
-            const float x_amax = _mm512_reduce_max_ps(x_amax_vec);
-            const float s_x = x_amax > 0.0f ? x_amax / 127.0f : 1.0f;
-            x_scale_workspace[t] = s_x;
-            const __m512 inv_s_x = _mm512_set1_ps(x_amax > 0.0f ? 127.0f / x_amax : 1.0f);
-            for (int d = 0; d < d_model; d += 16) {
-                const __m512i q = _mm512_cvt_roundps_epi32(
-                    _mm512_mul_ps(_mm512_loadu_ps(xt + d), inv_s_x),
-                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
-                                 _mm512_cvtsepi32_epi8(q));
-            }
-            x_sum_workspace[t] = sum_int8(xq, d_model);
-        }
+        moe_forward_s4(x, w, y, num_tokens);
+        return;
+    }
 
-        // Batched AMX router GEMM over 16-token blocks.  Each block writes
-        // coarse scores into score_workspace[t][e] for e in [0, padded_experts).
-        // Parallelized across blocks: AMX tile registers and the tile config
-        // are per-thread state, and each block writes a distinct set of token
-        // rows in score_workspace, so there are no races.  The win over the
-        // per-token VNNI path is compute density (16 experts x 16 tokens per
-        // _tile_dpbusd) AND retaining the 16-thread parallelism.
-        const int num_blocks = (num_tokens + 15) / 16;
-#pragma omp parallel for if (num_blocks >= 2) schedule(static)
-        for (int blk = 0; blk < num_blocks; ++blk) {
-            const int block_begin = blk * 16;
-            const int B = (num_tokens - block_begin < 16) ? (num_tokens - block_begin) : 16;
-            router_amx_batch(xq_workspace, x_scale_workspace, x_sum_workspace,
-                            w_router_amx, s_router, score_workspace,
-                            block_begin, B, d_model, num_experts,
-                            g_router_padded_experts);
-        }
+    // ======================================================================
+    // S3: N=128, E=16, batched FFN with ZMM weight reuse.  Isolated via
+    // noinline+cold from S1 (per-task) and S2 (intra-FFN).
+    // ======================================================================
+    const int slots = top_k + 1;
+    const int total_tasks = num_tokens * slots;
+    const bool use_batched_ffn = (total_tasks >= 32) && (d_ff >= 64)
+                                 && (d_model >= 256);
+    if (use_batched_ffn) {
+        moe_forward_s3(x, w, y, num_tokens);
+        return;
+    }
 
-        // Per-token Top-M heap + FP32 rescore + Top-K, parallel across tokens.
-        // Identical to the VNNI router's post-GEMV stage so Top-K selection
-        // semantics (stable worst-root heap, ascending-index tie, fp32 rescore)
-        // are unchanged — only the score computation differs.
-#pragma omp parallel for if (num_tokens >= 4) schedule(static)
-        for (int t = 0; t < num_tokens; ++t) {
-            const float* const xt = x + static_cast<size_t>(t) * d_model;
-            float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
-            int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-            float gate_sum = 0.0f;
+    // ======================================================================
+    // S2: N=1, D=1024, intra-FFN thread splitting (large d_model).  Isolated
+    // via noinline+cold from S1 (per-task, smaller d_model).
+    // ======================================================================
+    const bool use_intra_ffn = (total_tasks <= 32) && (d_ff >= 64) && (d_model >= 512);
+    if (use_intra_ffn) {
+        moe_forward_s2(x, w, y, num_tokens);
+        return;
+    }
 
-            constexpr int kCoarseCandidates = 16;
-            int candidates[kCoarseCandidates];
-            float candidate_biased[kCoarseCandidates];
-            auto coarse_better = [](float lhs_score, int lhs_expert,
-                                    float rhs_score, int rhs_expert) {
-                return lhs_score > rhs_score ||
-                    (lhs_score == rhs_score && lhs_expert < rhs_expert);
-            };
-            for (int i = 0; i < kCoarseCandidates; ++i) {
-                candidates[i] = i;
-                candidate_biased[i] = scores[i] + w.bias[i];
-            }
-            auto sift_worst_down = [&](int root) {
-                for (;;) {
-                    const int left = root * 2 + 1;
-                    if (left >= kCoarseCandidates) break;
-                    const int right = left + 1;
-                    int worst = root;
-                    if (coarse_better(candidate_biased[worst], candidates[worst],
-                                      candidate_biased[left], candidates[left])) {
-                        worst = left;
-                    }
-                    if (right < kCoarseCandidates &&
-                        coarse_better(candidate_biased[worst], candidates[worst],
-                                      candidate_biased[right], candidates[right])) {
-                        worst = right;
-                    }
-                    if (worst == root) break;
-                    std::swap(candidates[root], candidates[worst]);
-                    std::swap(candidate_biased[root], candidate_biased[worst]);
-                    root = worst;
-                }
-            };
-            for (int root = kCoarseCandidates / 2 - 1; root >= 0; --root) {
-                sift_worst_down(root);
-            }
-            for (int e = kCoarseCandidates; e < num_experts; ++e) {
-                const float biased = scores[e] + w.bias[e];
-                if (coarse_better(biased, e, candidate_biased[0], candidates[0])) {
-                    candidates[0] = e;
-                    candidate_biased[0] = biased;
-                    sift_worst_down(0);
-                }
-            }
-            constexpr int candidate_count = kCoarseCandidates;
+    // ======================================================================
+    // S1: N=1, D=256, per-task expert_ffn with 5-thread OpenMP.  The fallback
+    // for small N + small d_model.
+    // ======================================================================
+    moe_forward_s1(x, w, y, num_tokens);
+}
 
-            for (int i = 0; i < candidate_count; ++i) {
-                const int e = candidates[i];
-                __m512 acc = _mm512_setzero_ps();
-                const float* const router_row =
-                    w.w_router + static_cast<size_t>(e) * d_model;
-                for (int d = 0; d < d_model; d += 16) {
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
-                                          _mm512_loadu_ps(xt + d), acc);
-                }
-                const float logit = _mm512_reduce_add_ps(acc);
-                scores[e] = 1.0f / (1.0f + expf(-logit));
-            }
+// ==========================================================================
+// Shared stage 1: fp32 router + quantization + top-K (S1/S2/S3).
+// Extracted as a noinline helper so each scenario function is independent.
+// ==========================================================================
+__attribute__((noinline))
+static void stage1_fp32_router(const float* x, const MoEWeights& w, int num_tokens) {
+    const int d_model = w.d_model;
+    const int d_ff = w.d_ff;
+    const int num_experts = w.num_experts;
+    const int top_k = w.top_k;
 
-            bool candidate_used[kCoarseCandidates] = {};
-            for (int k = 0; k < top_k; ++k) {
-                int best_i = -1;
-                for (int i = 0; i < candidate_count; ++i) {
-                    if (candidate_used[i]) continue;
-                    const int e = candidates[i];
-                    if (best_i < 0) {
-                        best_i = i;
-                        continue;
-                    }
-                    const int best_e = candidates[best_i];
-                    const float biased = scores[e] + w.bias[e];
-                    const float best_biased = scores[best_e] + w.bias[best_e];
-                    if (biased > best_biased ||
-                        (biased == best_biased && e < best_e)) {
-                        best_i = i;
-                    }
-                }
-                const int best = candidates[best_i];
-                candidate_used[best_i] = true;
-                topk_idx[k] = best;
-                gate_sum += scores[best];
-            }
-            gate_sum_workspace[t] = gate_sum;
-        }
-    } else {
-    // Stage 1: router, Top-K metadata, and quantization.  All output arrays
-    // are indexed by token, hence this is race-free and allocation-free.
-    // For tiny N (S1/S2: one token) the router and top-K are pure overhead
-    // with no parallelism to exploit, so run them serially to skip the
-    // OpenMP fork/join.  Larger N parallelizes across tokens.
 #pragma omp parallel for if (num_tokens >= 4) schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* const xt = x + static_cast<size_t>(t) * d_model;
         float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
         int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
 
-        // Quantize before routing so the W8A8 coarse router can reuse xq.
-        // x_sum_workspace must remain populated for the accepted S2 intra-FFN
-        // gate/up VNNI correction term.
         __m512 x_amax_vec = _mm512_setzero_ps();
         for (int d = 0; d < d_model; d += 16) {
             x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
@@ -1335,211 +1239,142 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
                              _mm512_cvtsepi32_epi8(q));
         }
-        const int32_t x_sum = sum_int8(xq, d_model);
-        x_sum_workspace[t] = x_sum;
+        x_sum_workspace[t] = sum_int8(xq, d_model);
 
         int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
         float gate_sum = 0.0f;
 
-        // S1/S2/S3 use the tested fp32 router.  The W8A8 candidate path is
-        // intentionally restricted to the E=512 S4-like shape.
-        if (num_experts == MAX_NUM_EXPERTS) {
-            const int k_groups = d_model / 4;
-            const __m512i x_correction = _mm512_set1_epi32(-128 * x_sum);
-            for (int e = 0; e < g_router_padded_experts; e += 16) {
-                // VNNI treats the packed q+128 weights as unsigned.  Start
-                // with -128 * sum(xq) to recover the signed W8A8 dot product.
-                __m512i acc = x_correction;
-                const uint8_t* const router_block =
-                    w_router_vnni + static_cast<size_t>(e) * d_model;
-                for (int k = 0; k < k_groups; ++k) {
-                    uint32_t x4;
-                    std::memcpy(&x4, xq + k * 4, sizeof(x4));
-                    acc = _mm512_dpbusd_epi32(
-                        acc,
-                        _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
-                            router_block + static_cast<size_t>(k) * 64)),
-                        _mm512_set1_epi32(static_cast<int32_t>(x4)));
-                }
-                const __m512 acc_f = _mm512_mul_ps(
-                    _mm512_cvtepi32_ps(acc),
-                    _mm512_mul_ps(_mm512_set1_ps(s_x), _mm512_loadu_ps(s_router + e)));
-                const __m512 s = _mm512_div_ps(
-                    _mm512_set1_ps(1.0f),
-                    _mm512_add_ps(_mm512_set1_ps(1.0f),
-                                  exp512_approx_ps(_mm512_sub_ps(_mm512_setzero_ps(), acc_f))));
-                _mm512_storeu_ps(scores + e, s);
+        for (int e = 0; e < num_experts; ++e) {
+            const float* const router_row =
+                w.w_router + static_cast<size_t>(e) * d_model;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            for (int d = 0; d < d_model; d += 32) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                       _mm512_loadu_ps(xt + d), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d + 16),
+                                       _mm512_loadu_ps(xt + d + 16), acc1);
             }
-
-            // Stable coarse Top-M by W8A8 affinity+bias.  Keep the worst
-            // retained candidate at heap root: this replaces the O(E*M)
-            // insertion scan with O(E + R*log(M)), while retaining the exact
-            // same Top-M set and ascending-index tie rule.
-            constexpr int kCoarseCandidates = 16;
-            int candidates[kCoarseCandidates];
-            float candidate_biased[kCoarseCandidates];
-            auto coarse_better = [](float lhs_score, int lhs_expert,
-                                    float rhs_score, int rhs_expert) {
-                return lhs_score > rhs_score ||
-                    (lhs_score == rhs_score && lhs_expert < rhs_expert);
-            };
-            for (int i = 0; i < kCoarseCandidates; ++i) {
-                candidates[i] = i;
-                candidate_biased[i] = scores[i] + w.bias[i];
-            }
-            auto sift_worst_down = [&](int root) {
-                for (;;) {
-                    const int left = root * 2 + 1;
-                    if (left >= kCoarseCandidates) break;
-                    const int right = left + 1;
-                    int worst = root;
-                    if (coarse_better(candidate_biased[worst], candidates[worst],
-                                      candidate_biased[left], candidates[left])) {
-                        worst = left;
-                    }
-                    if (right < kCoarseCandidates &&
-                        coarse_better(candidate_biased[worst], candidates[worst],
-                                      candidate_biased[right], candidates[right])) {
-                        worst = right;
-                    }
-                    if (worst == root) break;
-                    std::swap(candidates[root], candidates[worst]);
-                    std::swap(candidate_biased[root], candidate_biased[worst]);
-                    root = worst;
-                }
-            };
-            for (int root = kCoarseCandidates / 2 - 1; root >= 0; --root) {
-                sift_worst_down(root);
-            }
-            for (int e = kCoarseCandidates; e < num_experts; ++e) {
-                const float biased = scores[e] + w.bias[e];
-                if (coarse_better(biased, e, candidate_biased[0], candidates[0])) {
-                    candidates[0] = e;
-                    candidate_biased[0] = biased;
-                    sift_worst_down(0);
-                }
-            }
-            constexpr int candidate_count = kCoarseCandidates;
-
-            // Rescore only the 16 candidates in fp32.  Replacing their score
-            // also makes selected gate values fp32, not quantized estimates.
-            for (int i = 0; i < candidate_count; ++i) {
-                const int e = candidates[i];
-                __m512 acc = _mm512_setzero_ps();
-                const float* const router_row =
-                    w.w_router + static_cast<size_t>(e) * d_model;
-                for (int d = 0; d < d_model; d += 16) {
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
-                                          _mm512_loadu_ps(xt + d), acc);
-                }
-                const float logit = _mm512_reduce_add_ps(acc);
-                scores[e] = 1.0f / (1.0f + expf(-logit));
-            }
-
-            bool candidate_used[kCoarseCandidates] = {};
-            for (int k = 0; k < top_k; ++k) {
-                int best_i = -1;
-                for (int i = 0; i < candidate_count; ++i) {
-                    if (candidate_used[i]) continue;
-                    const int e = candidates[i];
-                    if (best_i < 0) {
-                        best_i = i;
-                        continue;
-                    }
-                    const int best_e = candidates[best_i];
-                    const float biased = scores[e] + w.bias[e];
-                    const float best_biased = scores[best_e] + w.bias[best_e];
-                    if (biased > best_biased ||
-                        (biased == best_biased && e < best_e)) {
-                        best_i = i;
-                    }
-                }
-                const int best = candidates[best_i];
-                candidate_used[best_i] = true;
-                topk_idx[k] = best;
-                gate_sum += scores[best];
-            }
-        } else {
-            // Existing fp32 router path retained for S1/S2/S3.
-            // V7 integration (from lab2_s1_scratch): process each expert's
-            // logit as a direct fp32 GEMV (W_router[e] · x), loading x in
-            // 16-wide ZMM chunks with 2 accumulators.  The old path loaded
-            // the transposed router (w_router_transpose) one element at a time
-            // via set1_ps(xt[d]) — 256 scalar broadcasts per expert vs 8
-            // vector loads here.  Same numerics (fp32 dot → sigmoid).
+            const float logit = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+            scores[e] = 1.0f / (1.0f + expf(-logit));
+        }
+        bool used[MAX_NUM_EXPERTS] = {};
+        for (int k = 0; k < top_k; ++k) {
+            int best = -1;
             for (int e = 0; e < num_experts; ++e) {
-                const float* const router_row =
-                    w.w_router + static_cast<size_t>(e) * d_model;
-                __m512 acc0 = _mm512_setzero_ps();
-                __m512 acc1 = _mm512_setzero_ps();
-                for (int d = 0; d < d_model; d += 32) {
-                    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
-                                           _mm512_loadu_ps(xt + d), acc0);
-                    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d + 16),
-                                           _mm512_loadu_ps(xt + d + 16), acc1);
+                if (!used[e] &&
+                    (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
+                    best = e;
                 }
-                const float logit = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
-                scores[e] = 1.0f / (1.0f + expf(-logit));
             }
-            bool used[MAX_NUM_EXPERTS] = {};
-            for (int k = 0; k < top_k; ++k) {
-                int best = -1;
-                for (int e = 0; e < num_experts; ++e) {
-                    if (!used[e] &&
-                        (best < 0 || scores[e] + w.bias[e] > scores[best] + w.bias[best])) {
-                        best = e;
-                    }
-                }
-                used[best] = true;
-                topk_idx[k] = best;
-                gate_sum += scores[best];
-            }
+            used[best] = true;
+            topk_idx[k] = best;
+            gate_sum += scores[best];
         }
         gate_sum_workspace[t] = gate_sum;
     }
-    }  // end of non-AMX-router Stage 1
+}
 
-    // Stage 2 + 3: compute every (token, expert-slot) FFN in parallel, then
-    // combine.  We organize the (token, slot) task space so adjacent tasks
-    // share the same token (slot is the inner index): the same xq and the
-    // shared-expert slot reuse the cache line just written by the
-    // quantization stage, and tokens iterated in the outer index keep the
-    // per-token outputs contiguous for the combine reduction.
-    const int slots = top_k + 1;  // slot 0 = shared, 1..K = routed
+// ==========================================================================
+// Shared combine: y_t = x_t + o_shared + sum_k gate_k * o_k (all scenarios).
+// ==========================================================================
+__attribute__((noinline))
+static void combine_outputs(const float* x, const MoEWeights& w, float* y, int num_tokens) {
+    const int d_model = w.d_model;
+    const int top_k = w.top_k;
+    const int slots = top_k + 1;
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const yt = y + static_cast<size_t>(t) * d_model;
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
+        const float* const outs = expert_out_workspace +
+                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
+        const float* o_shared = outs;
+        __m512 gk[MAX_TOP_K];
+        for (int k = 0; k < top_k; ++k) {
+            const int e = topk_idx[k];
+            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
+        }
+        for (int d = 0; d < d_model; d += 16) {
+            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
+                                       _mm512_loadu_ps(o_shared + d));
+            for (int k = 0; k < top_k; ++k) {
+                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
+                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            }
+            _mm512_storeu_ps(yt + d, acc);
+        }
+    }
+}
+
+// ==========================================================================
+// S1: N=1, D=256 — per-task expert_ffn with capped OpenMP team.
+// ==========================================================================
+__attribute__((noinline))
+static void moe_forward_s1(const float* x, const MoEWeights& w, float* y, int num_tokens) {
+    const int d_model = w.d_model;
+    const int d_ff = w.d_ff;
+    const int top_k = w.top_k;
+    const int slots = top_k + 1;
     const int total_tasks = num_tokens * slots;
 
-    // For small N (S1: N=1, 5 tasks; S2: N=1, 5 tasks), the (token, slot)
-    // task space cannot fill 16 threads.  Split each expert_ffn internally
-    // across threads: gate/up and down both iterate in 16-wide blocks over
-    // d_ff / d_model, giving 5*(d_ff/16 + d_model/16) fine-grained tasks.
-    // The two stages are separated by a barrier because requantization
-    // needs the global h_amax (a reduction across all f-blocks of a task).
-    //
-    // Threshold: when total_tasks is large enough to keep 16 threads busy
-    // on its own (S3: 640, S4: 3072), intra-FFN splitting only adds
-    // overhead and cache contention, so we keep the original 1-task-per-
-    // thread path.  The crossover is around 32 tasks (2 tokens × 16 threads
-    // gives ~16 f-blocks per thread at d_ff=128 — a useful grain count).
-    // S1 (d_model=256, d_ff=128) is too short for the two barriers to pay
-    // back their cost; S2's 1024-wide down projection is large enough to win.
-    const bool use_intra_ffn = (total_tasks <= 32) && (d_ff >= 64) && (d_model >= 512);
+    stage1_fp32_router(x, w, num_tokens);
+
+    const int ffn_threads_cap = (total_tasks < 64) ? total_tasks : 16;
+#pragma omp parallel for if (total_tasks >= 2) schedule(static) num_threads(ffn_threads_cap)
+    for (int task = 0; task < total_tasks; ++task) {
+        const int t = task / slots;
+        const int slot = task % slots;
+        const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+        float* const out = expert_out_workspace +
+                           static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                           static_cast<size_t>(slot) * MAX_D_MODEL;
+        if (slot == 0) {
+#if USE_AMX
+            expert_ffn(w_sh_gate_vnni, w_sh_up_vnni, w_sh_down_vnni,
+                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
+                       x_scale_workspace[t], out, d_model, d_ff);
+#else
+            expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose,
+                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
+                       x_scale_workspace[t], out, d_model, d_ff);
+#endif
+        } else {
+            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+            const int e = topk_idx[slot - 1];
+            expert_ffn(w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model,
+                       w_up_transpose + static_cast<size_t>(e) * d_ff * d_model,
+                       w_down_transpose + static_cast<size_t>(e) * d_model * d_ff,
+                       w.s_gate[e], w.s_up[e], w.s_down[e], xq,
+                       x_scale_workspace[t], out, d_model, d_ff);
+        }
+    }
+
+    combine_outputs(x, w, y, num_tokens);
+}
+
+// ==========================================================================
+// S2: N=1, D=1024 — intra-FFN thread splitting (large d_model).
+// ==========================================================================
+__attribute__((noinline))
+static void moe_forward_s2(const float* x, const MoEWeights& w, float* y, int num_tokens) {
+    const int d_model = w.d_model;
+    const int d_ff = w.d_ff;
+    const int top_k = w.top_k;
+    const int slots = top_k + 1;
+    const int total_tasks = num_tokens * slots;
     const int n_fblocks = d_ff / 16;
     const int n_dblocks = d_model / 16;
+    const int fblock_tasks = total_tasks * n_fblocks;
+    const int dblock_tasks = total_tasks * n_dblocks;
 
-    if (use_intra_ffn) {
-        // Per-(token, slot) pointer helpers into the flat workspaces.
-        // slot_stride is in units of MAX_D_FF for h/hq and MAX_D_MODEL for out.
-        const int fblock_tasks = total_tasks * n_fblocks;
-        const int dblock_tasks = total_tasks * n_dblocks;
+    stage1_fp32_router(x, w, num_tokens);
 
-        // Use a single persistent parallel region to amortize the OpenMP
-        // fork/join overhead across the three intra-FFN stages.  Each stage
-        // is an omp for with an implicit barrier between them (required by
-        // the data dependency: stage 2 reads h written by stage 1, and
-        // stage 3 reads hq written by stage 2).
 #pragma omp parallel num_threads(16)
-        {
-        // Stage 1: gate/up + SwiGLU, parallel over (task, f-block).
+    {
 #pragma omp for schedule(static)
         for (int bt = 0; bt < fblock_tasks; ++bt) {
             const int task = bt / n_fblocks;
@@ -1554,7 +1389,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             float* amax_slot = intra_fblock_amax +
                                 static_cast<size_t>(t) * slots * (MAX_D_FF / 16) +
                                 static_cast<size_t>(slot) * (MAX_D_FF / 16);
-
             const uint8_t* w_gate;
             const uint8_t* w_up;
             float s_gate, s_up;
@@ -1577,10 +1411,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                                     d_model, d_ff, f0,
                                     h, &amax_slot[f0 / 16]);
         }
-
-        // Stage 2: per-task reduce + requant (serial within a task, but
-        // tasks are independent so we parallelize across tasks).  Each task
-        // touches only its own h/hq/amax slice, so it's race-free.
 #pragma omp for schedule(static)
         for (int task = 0; task < total_tasks; ++task) {
             const int t = task / slots;
@@ -1596,8 +1426,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             int32_t* hq_sum_slot = intra_hq_sum + static_cast<size_t>(t) * slots + slot;
             expert_ffn_requant(amax_slot, n_fblocks, h, hq, s_h_slot, hq_sum_slot);
         }
-
-        // Stage 3: down projection, parallel over (task, d-block).
 #pragma omp for schedule(static)
         for (int bt = 0; bt < dblock_tasks; ++bt) {
             const int task = bt / n_dblocks;
@@ -1611,7 +1439,6 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             float* out = expert_out_workspace +
                          static_cast<size_t>(t) * slots * MAX_D_MODEL +
                          static_cast<size_t>(slot) * MAX_D_MODEL + d0;
-
             const uint8_t* w_down;
             float s_down;
             if (slot == 0) {
@@ -1630,190 +1457,340 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
             expert_ffn_down_block(w_down, s_down, hq, hq_sum, s_h,
                                   d_model, d_ff, d0, out);
         }
-        }  // end parallel region
-    } else {
-    // The (token, slot) FFN loop's work per task is uniform, but its task
-    // count varies wildly with N (5 for S1, 3072 for S4).  Cap the team size
-    // so small-N cases don't pay OpenMP's per-thread overhead for threads
-    // that have nothing to do, while large-N cases still scale out.
+    }
 
-    // Batched FFN with ZMM weight reuse (S4 large-N and S3).
-    // Each expert's B tokens are processed in one call, loading weights once
-    // and reusing across the inner B-loop.  Validated in round-004 (S4
-    // -40.43%); the noinline+cold above isolate S1/S2 from the binary-level
-    // side effect that caused the +11472% S2 regression.  S3 (E=16, d_model=256)
-    // also takes the batched path: its per-expert weight load is 31.6% of S3
-    // CPU (006v2 VTune), so ZMM register reuse across B tokens cuts load
-    // bandwidth.  S1 (5 tasks < 32) falls through to per-task; S2 takes intra.
-    const bool use_batched_ffn = (total_tasks >= 32) && (d_ff >= 64)
-                                 && (d_model >= 256);
+    combine_outputs(x, w, y, num_tokens);
+}
 
-    if (use_batched_ffn) {
-        // Step 1: count-sort (token,slot) tasks by expert id.
-        const int shared_bucket = num_experts;
-        for (int e = 0; e <= num_experts + 1; ++e) expert_token_count[e] = 0;
-        for (int t = 0; t < num_tokens; ++t) {
-            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-            expert_token_count[shared_bucket]++;
-            for (int s = 0; s < top_k; ++s) {
-                const int e = topk_idx[s];
-                if (e >= 0 && e < num_experts) expert_token_count[e]++;
+// ==========================================================================
+// S3: N=128 — batched FFN with ZMM weight reuse.
+// ==========================================================================
+__attribute__((noinline))
+static void moe_forward_s3(const float* x, const MoEWeights& w, float* y, int num_tokens) {
+    const int d_model = w.d_model;
+    const int d_ff = w.d_ff;
+    const int num_experts = w.num_experts;
+    const int top_k = w.top_k;
+    const int slots = top_k + 1;
+
+    stage1_fp32_router(x, w, num_tokens);
+
+    const int shared_bucket = num_experts;
+    for (int e = 0; e <= num_experts + 1; ++e) expert_token_count[e] = 0;
+    for (int t = 0; t < num_tokens; ++t) {
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        expert_token_count[shared_bucket]++;
+        for (int s = 0; s < top_k; ++s) {
+            const int e = topk_idx[s];
+            if (e >= 0 && e < num_experts) expert_token_count[e]++;
+        }
+    }
+    expert_token_offset[0] = 0;
+    for (int e = 1; e <= num_experts + 1; ++e) {
+        expert_token_offset[e] = expert_token_offset[e - 1] + expert_token_count[e - 1];
+    }
+    for (int e = 0; e <= num_experts; ++e) expert_token_count[e] = expert_token_offset[e];
+    for (int t = 0; t < num_tokens; ++t) {
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        sorted_token_ids[expert_token_count[shared_bucket]] = t;
+        sorted_slot_ids[expert_token_count[shared_bucket]] = 0;
+        expert_token_count[shared_bucket]++;
+        for (int s = 0; s < top_k; ++s) {
+            const int e = topk_idx[s];
+            if (e >= 0 && e < num_experts) {
+                sorted_token_ids[expert_token_count[e]] = t;
+                sorted_slot_ids[expert_token_count[e]] = s + 1;
+                expert_token_count[e]++;
             }
         }
-        expert_token_offset[0] = 0;
-        for (int e = 1; e <= num_experts + 1; ++e) {
-            expert_token_offset[e] = expert_token_offset[e - 1] + expert_token_count[e - 1];
+    }
+    int num_batches = 0;
+    for (int e = 0; e <= num_experts; ++e) {
+        const int start = expert_token_offset[e];
+        const int count = expert_token_offset[e + 1] - start;
+        if (count == 0) continue;
+        const int is_shared = (e == shared_bucket) ? 1 : 0;
+        for (int b0 = 0; b0 < count; b0 += EXPERT_FFN_BATCH_B_MAX) {
+            const int B = (count - b0 < EXPERT_FFN_BATCH_B_MAX)
+                              ? (count - b0) : EXPERT_FFN_BATCH_B_MAX;
+            batch_expert_id[num_batches] = e;
+            batch_B[num_batches] = B;
+            batch_token_start[num_batches] = start + b0;
+            batch_is_shared[num_batches] = is_shared;
+            ++num_batches;
         }
-        for (int e = 0; e <= num_experts; ++e) expert_token_count[e] = expert_token_offset[e];
-        for (int t = 0; t < num_tokens; ++t) {
-            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-            sorted_token_ids[expert_token_count[shared_bucket]] = t;
-            sorted_slot_ids[expert_token_count[shared_bucket]] = 0;
-            expert_token_count[shared_bucket]++;
-            for (int s = 0; s < top_k; ++s) {
-                const int e = topk_idx[s];
-                if (e >= 0 && e < num_experts) {
-                    sorted_token_ids[expert_token_count[e]] = t;
-                    sorted_slot_ids[expert_token_count[e]] = s + 1;
-                    expert_token_count[e]++;
-                }
-            }
-        }
-
-        // Step 2: build flat batch list (B = EXPERT_FFN_BATCH_B_MAX, last batch shorter).
-        int num_batches = 0;
-        for (int e = 0; e <= num_experts; ++e) {
-            const int start = expert_token_offset[e];
-            const int count = expert_token_offset[e + 1] - start;
-            if (count == 0) continue;
-            const int is_shared = (e == shared_bucket) ? 1 : 0;
-            for (int b0 = 0; b0 < count; b0 += EXPERT_FFN_BATCH_B_MAX) {
-                const int B = (count - b0 < EXPERT_FFN_BATCH_B_MAX)
-                                  ? (count - b0) : EXPERT_FFN_BATCH_B_MAX;
-                batch_expert_id[num_batches] = e;
-                batch_B[num_batches] = B;
-                batch_token_start[num_batches] = start + b0;
-                batch_is_shared[num_batches] = is_shared;
-                ++num_batches;
-            }
-        }
-
-        // Step 3: parallel-for over batches (dynamic schedule per IDEA-003 lesson).
-        const int batch_threads = (num_batches < 16) ? num_batches : 16;
+    }
+    const int batch_threads = (num_batches < 16) ? num_batches : 16;
 #pragma omp parallel for if (num_batches >= 2) schedule(dynamic, 1) num_threads(batch_threads)
-        for (int bi = 0; bi < num_batches; ++bi) {
-            const int e = batch_expert_id[bi];
-            const int B = batch_B[bi];
-            const int token_start = batch_token_start[bi];
-            const int is_shared = batch_is_shared[bi];
-
-            const uint8_t* w_gate;
-            const uint8_t* w_up;
-            const uint8_t* w_down;
-            float s_gate, s_up, s_down;
-            if (is_shared) {
+    for (int bi = 0; bi < num_batches; ++bi) {
+        const int e = batch_expert_id[bi];
+        const int B = batch_B[bi];
+        const int token_start = batch_token_start[bi];
+        const int is_shared = batch_is_shared[bi];
+        const uint8_t* w_gate;
+        const uint8_t* w_up;
+        const uint8_t* w_down;
+        float s_gate, s_up, s_down;
+        if (is_shared) {
 #if USE_AMX
-                w_gate = w_sh_gate_vnni; w_up = w_sh_up_vnni; w_down = w_sh_down_vnni;
+            w_gate = w_sh_gate_vnni; w_up = w_sh_up_vnni; w_down = w_sh_down_vnni;
 #else
-                w_gate = w_sh_gate_transpose; w_up = w_sh_up_transpose; w_down = w_sh_down_transpose;
+            w_gate = w_sh_gate_transpose; w_up = w_sh_up_transpose; w_down = w_sh_down_transpose;
 #endif
-                s_gate = w.sh_s_gate; s_up = w.sh_s_up; s_down = w.sh_s_down;
-            } else {
-                w_gate = w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model;
-                w_up   = w_up_transpose   + static_cast<size_t>(e) * d_ff * d_model;
-                w_down = w_down_transpose + static_cast<size_t>(e) * d_model * d_ff;
-                s_gate = w.s_gate[e]; s_up = w.s_up[e]; s_down = w.s_down[e];
-            }
-
-            const int8_t* xq_list[EXPERT_FFN_BATCH_B_MAX];
-            float s_x_list[EXPERT_FFN_BATCH_B_MAX];
-            int32_t x_sum_list[EXPERT_FFN_BATCH_B_MAX];
-            float* out_list[EXPERT_FFN_BATCH_B_MAX];
-            for (int b = 0; b < B; ++b) {
-                const int task_idx = token_start + b;
-                const int t = sorted_token_ids[task_idx];
-                const int slot = sorted_slot_ids[task_idx];
-                xq_list[b] = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
-                s_x_list[b] = x_scale_workspace[t];
-                x_sum_list[b] = x_sum_workspace[t];
-                out_list[b] = expert_out_workspace +
-                              static_cast<size_t>(t) * slots * MAX_D_MODEL +
-                              static_cast<size_t>(slot) * MAX_D_MODEL;
-            }
-
-            expert_ffn_batch(w_gate, w_up, w_down, s_gate, s_up, s_down,
-                             xq_list, s_x_list, x_sum_list, out_list,
-                             B, d_model, d_ff);
-        }
-    } else {
-    const int ffn_threads_cap = (total_tasks < 64) ? total_tasks : 16;
-#pragma omp parallel for if (total_tasks >= 2) schedule(static) num_threads(ffn_threads_cap)
-    for (int task = 0; task < total_tasks; ++task) {
-        const int t = task / slots;
-        const int slot = task % slots;
-        const int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
-        float* const out = expert_out_workspace +
-                           static_cast<size_t>(t) * slots * MAX_D_MODEL +
-                           static_cast<size_t>(slot) * MAX_D_MODEL;
-
-        if (slot == 0) {
-            // Shared expert (gate weight = 1, applied in combine).
-#if USE_AMX
-            expert_ffn(w_sh_gate_vnni, w_sh_up_vnni, w_sh_down_vnni,
-                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
-                       x_scale_workspace[t], out, d_model, d_ff);
-#else
-            expert_ffn(w_sh_gate_transpose, w_sh_up_transpose, w_sh_down_transpose,
-                       w.sh_s_gate, w.sh_s_up, w.sh_s_down, xq,
-                       x_scale_workspace[t], out, d_model, d_ff);
-#endif
+            s_gate = w.sh_s_gate; s_up = w.sh_s_up; s_down = w.sh_s_down;
         } else {
-            const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-            const int e = topk_idx[slot - 1];
-            expert_ffn(w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model,
-                       w_up_transpose + static_cast<size_t>(e) * d_ff * d_model,
-                       w_down_transpose + static_cast<size_t>(e) * d_model * d_ff,
-                       w.s_gate[e], w.s_up[e], w.s_down[e], xq,
-                       x_scale_workspace[t], out, d_model, d_ff);
+            w_gate = w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model;
+            w_up   = w_up_transpose   + static_cast<size_t>(e) * d_ff * d_model;
+            w_down = w_down_transpose + static_cast<size_t>(e) * d_model * d_ff;
+            s_gate = w.s_gate[e]; s_up = w.s_up[e]; s_down = w.s_down[e];
         }
-    }
-    }
+        const int8_t* xq_list[EXPERT_FFN_BATCH_B_MAX];
+        float s_x_list[EXPERT_FFN_BATCH_B_MAX];
+        int32_t x_sum_list[EXPERT_FFN_BATCH_B_MAX];
+        float* out_list[EXPERT_FFN_BATCH_B_MAX];
+        for (int b = 0; b < B; ++b) {
+            const int task_idx = token_start + b;
+            const int t = sorted_token_ids[task_idx];
+            const int slot = sorted_slot_ids[task_idx];
+            xq_list[b] = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+            s_x_list[b] = x_scale_workspace[t];
+            x_sum_list[b] = x_sum_workspace[t];
+            out_list[b] = expert_out_workspace +
+                          static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                          static_cast<size_t>(slot) * MAX_D_MODEL;
+        }
+        expert_ffn_batch(w_gate, w_up, w_down, s_gate, s_up, s_down,
+                         xq_list, s_x_list, x_sum_list, out_list,
+                         B, d_model, d_ff);
     }
 
-    // Combine: y_t = x_t + 1*o_shared + sum_k gate_k * o_k.  Single streaming
-    // pass over d: yt is kept in a ZMM register (or reloaded once per block),
-    // residual+shared added first, then each routed expert's gate*o_k fused in
-    // via fmadd.  This halves the number of y-stream passes vs the previous
-    // (top_k+1)-pass version and keeps o_shared/o_k in cache while yt is live.
-    // For top_k=4 (S1/S2/S3) this is 1 pass with 4 fmadd/block instead of 5;
-    // for top_k=2 (S4) it is 1 pass with 2 fmadd/block instead of 3.
+    combine_outputs(x, w, y, num_tokens);
+}
+
+// ==========================================================================
+// S4: N=1024, E=512 — AMX batched router + batched FFN.
+// ==========================================================================
+__attribute__((noinline))
+static void moe_forward_s4(const float* x, const MoEWeights& w, float* y, int num_tokens) {
+    const int d_model = w.d_model;
+    const int d_ff = w.d_ff;
+    const int num_experts = w.num_experts;
+    const int top_k = w.top_k;
+    const int slots = top_k + 1;
+
+    // Stage 1: quantize all tokens, then AMX batched router.
 #pragma omp parallel for if (num_tokens >= 4) schedule(static)
     for (int t = 0; t < num_tokens; ++t) {
         const float* const xt = x + static_cast<size_t>(t) * d_model;
-        float* const yt = y + static_cast<size_t>(t) * d_model;
-        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
-        const float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
-        const float inv_gate_sum = 1.0f / gate_sum_workspace[t];
-        const float* const outs = expert_out_workspace +
-                                  static_cast<size_t>(t) * slots * MAX_D_MODEL;
-
-        // Precompute each routed expert's normalized gate once per token.
-        const float* o_shared = outs;
-        __m512 gk[MAX_TOP_K];
-        for (int k = 0; k < top_k; ++k) {
-            const int e = topk_idx[k];
-            gk[k] = _mm512_set1_ps(scores[e] * inv_gate_sum);
-        }
-
-        // Single streaming pass: yt = xt + o_shared + sum_k gk[k]*o_k.
+        int8_t* const xq = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+        __m512 x_amax_vec = _mm512_setzero_ps();
         for (int d = 0; d < d_model; d += 16) {
-            __m512 acc = _mm512_add_ps(_mm512_loadu_ps(xt + d),
-                                       _mm512_loadu_ps(o_shared + d));
-            for (int k = 0; k < top_k; ++k) {
-                const float* o_k = outs + static_cast<size_t>(k + 1) * MAX_D_MODEL;
-                acc = _mm512_fmadd_ps(gk[k], _mm512_loadu_ps(o_k + d), acc);
+            x_amax_vec = _mm512_max_ps(x_amax_vec, _mm512_abs_ps(_mm512_loadu_ps(xt + d)));
+        }
+        const float x_amax = _mm512_reduce_max_ps(x_amax_vec);
+        const float s_x = x_amax > 0.0f ? x_amax / 127.0f : 1.0f;
+        x_scale_workspace[t] = s_x;
+        const __m512 inv_s_x = _mm512_set1_ps(x_amax > 0.0f ? 127.0f / x_amax : 1.0f);
+        for (int d = 0; d < d_model; d += 16) {
+            const __m512i q = _mm512_cvt_roundps_epi32(
+                _mm512_mul_ps(_mm512_loadu_ps(xt + d), inv_s_x),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(xq + d),
+                             _mm512_cvtsepi32_epi8(q));
+        }
+        x_sum_workspace[t] = sum_int8(xq, d_model);
+    }
+
+    const int num_blocks = (num_tokens + 15) / 16;
+#pragma omp parallel for if (num_blocks >= 2) schedule(static)
+    for (int blk = 0; blk < num_blocks; ++blk) {
+        const int block_begin = blk * 16;
+        const int B = (num_tokens - block_begin < 16) ? (num_tokens - block_begin) : 16;
+        router_amx_batch(xq_workspace, x_scale_workspace, x_sum_workspace,
+                        w_router_amx, s_router, score_workspace,
+                        block_begin, B, d_model, num_experts,
+                        g_router_padded_experts);
+    }
+
+#pragma omp parallel for if (num_tokens >= 4) schedule(static)
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* const xt = x + static_cast<size_t>(t) * d_model;
+        float* const scores = score_workspace + static_cast<size_t>(t) * MAX_NUM_EXPERTS;
+        int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        float gate_sum = 0.0f;
+
+        constexpr int kCoarseCandidates = 16;
+        int candidates[kCoarseCandidates];
+        float candidate_biased[kCoarseCandidates];
+        auto coarse_better = [](float lhs_score, int lhs_expert,
+                                float rhs_score, int rhs_expert) {
+            return lhs_score > rhs_score ||
+                (lhs_score == rhs_score && lhs_expert < rhs_expert);
+        };
+        for (int i = 0; i < kCoarseCandidates; ++i) {
+            candidates[i] = i;
+            candidate_biased[i] = scores[i] + w.bias[i];
+        }
+        auto sift_worst_down = [&](int root) {
+            for (;;) {
+                const int left = root * 2 + 1;
+                if (left >= kCoarseCandidates) break;
+                const int right = left + 1;
+                int worst = root;
+                if (coarse_better(candidate_biased[worst], candidates[worst],
+                                  candidate_biased[left], candidates[left])) {
+                    worst = left;
+                }
+                if (right < kCoarseCandidates &&
+                    coarse_better(candidate_biased[worst], candidates[worst],
+                                  candidate_biased[right], candidates[right])) {
+                    worst = right;
+                }
+                if (worst == root) break;
+                std::swap(candidates[root], candidates[worst]);
+                std::swap(candidate_biased[root], candidate_biased[worst]);
+                root = worst;
             }
-            _mm512_storeu_ps(yt + d, acc);
+        };
+        for (int root = kCoarseCandidates / 2 - 1; root >= 0; --root) {
+            sift_worst_down(root);
+        }
+        for (int e = kCoarseCandidates; e < num_experts; ++e) {
+            const float biased = scores[e] + w.bias[e];
+            if (coarse_better(biased, e, candidate_biased[0], candidates[0])) {
+                candidates[0] = e;
+                candidate_biased[0] = biased;
+                sift_worst_down(0);
+            }
+        }
+        constexpr int candidate_count = kCoarseCandidates;
+        for (int i = 0; i < candidate_count; ++i) {
+            const int e = candidates[i];
+            __m512 acc = _mm512_setzero_ps();
+            const float* const router_row =
+                w.w_router + static_cast<size_t>(e) * d_model;
+            for (int d = 0; d < d_model; d += 16) {
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(router_row + d),
+                                      _mm512_loadu_ps(xt + d), acc);
+            }
+            const float logit = _mm512_reduce_add_ps(acc);
+            scores[e] = 1.0f / (1.0f + expf(-logit));
+        }
+        bool candidate_used[kCoarseCandidates] = {};
+        for (int k = 0; k < top_k; ++k) {
+            int best_i = -1;
+            for (int i = 0; i < candidate_count; ++i) {
+                if (candidate_used[i]) continue;
+                const int e = candidates[i];
+                if (best_i < 0) {
+                    best_i = i;
+                    continue;
+                }
+                const int best_e = candidates[best_i];
+                const float biased = scores[e] + w.bias[e];
+                const float best_biased = scores[best_e] + w.bias[best_e];
+                if (biased > best_biased ||
+                    (biased == best_biased && e < best_e)) {
+                    best_i = i;
+                }
+            }
+            const int best = candidates[best_i];
+            candidate_used[best_i] = true;
+            topk_idx[k] = best;
+            gate_sum += scores[best];
+        }
+        gate_sum_workspace[t] = gate_sum;
+    }
+
+    // Stage 2: batched FFN (same as S3).
+    const int shared_bucket = num_experts;
+    for (int e = 0; e <= num_experts + 1; ++e) expert_token_count[e] = 0;
+    for (int t = 0; t < num_tokens; ++t) {
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        expert_token_count[shared_bucket]++;
+        for (int s = 0; s < top_k; ++s) {
+            const int e = topk_idx[s];
+            if (e >= 0 && e < num_experts) expert_token_count[e]++;
         }
     }
+    expert_token_offset[0] = 0;
+    for (int e = 1; e <= num_experts + 1; ++e) {
+        expert_token_offset[e] = expert_token_offset[e - 1] + expert_token_count[e - 1];
+    }
+    for (int e = 0; e <= num_experts; ++e) expert_token_count[e] = expert_token_offset[e];
+    for (int t = 0; t < num_tokens; ++t) {
+        const int* const topk_idx = topk_workspace + static_cast<size_t>(t) * MAX_TOP_K;
+        sorted_token_ids[expert_token_count[shared_bucket]] = t;
+        sorted_slot_ids[expert_token_count[shared_bucket]] = 0;
+        expert_token_count[shared_bucket]++;
+        for (int s = 0; s < top_k; ++s) {
+            const int e = topk_idx[s];
+            if (e >= 0 && e < num_experts) {
+                sorted_token_ids[expert_token_count[e]] = t;
+                sorted_slot_ids[expert_token_count[e]] = s + 1;
+                expert_token_count[e]++;
+            }
+        }
+    }
+    int num_batches = 0;
+    for (int e = 0; e <= num_experts; ++e) {
+        const int start = expert_token_offset[e];
+        const int count = expert_token_offset[e + 1] - start;
+        if (count == 0) continue;
+        const int is_shared = (e == shared_bucket) ? 1 : 0;
+        for (int b0 = 0; b0 < count; b0 += EXPERT_FFN_BATCH_B_MAX) {
+            const int B = (count - b0 < EXPERT_FFN_BATCH_B_MAX)
+                              ? (count - b0) : EXPERT_FFN_BATCH_B_MAX;
+            batch_expert_id[num_batches] = e;
+            batch_B[num_batches] = B;
+            batch_token_start[num_batches] = start + b0;
+            batch_is_shared[num_batches] = is_shared;
+            ++num_batches;
+        }
+    }
+    const int batch_threads = (num_batches < 16) ? num_batches : 16;
+#pragma omp parallel for if (num_batches >= 2) schedule(dynamic, 1) num_threads(batch_threads)
+    for (int bi = 0; bi < num_batches; ++bi) {
+        const int e = batch_expert_id[bi];
+        const int B = batch_B[bi];
+        const int token_start = batch_token_start[bi];
+        const int is_shared = batch_is_shared[bi];
+        const uint8_t* w_gate;
+        const uint8_t* w_up;
+        const uint8_t* w_down;
+        float s_gate, s_up, s_down;
+        if (is_shared) {
+#if USE_AMX
+            w_gate = w_sh_gate_vnni; w_up = w_sh_up_vnni; w_down = w_sh_down_vnni;
+#else
+            w_gate = w_sh_gate_transpose; w_up = w_sh_up_transpose; w_down = w_sh_down_transpose;
+#endif
+            s_gate = w.sh_s_gate; s_up = w.sh_s_up; s_down = w.sh_s_down;
+        } else {
+            w_gate = w_gate_transpose + static_cast<size_t>(e) * d_ff * d_model;
+            w_up   = w_up_transpose   + static_cast<size_t>(e) * d_ff * d_model;
+            w_down = w_down_transpose + static_cast<size_t>(e) * d_model * d_ff;
+            s_gate = w.s_gate[e]; s_up = w.s_up[e]; s_down = w.s_down[e];
+        }
+        const int8_t* xq_list[EXPERT_FFN_BATCH_B_MAX];
+        float s_x_list[EXPERT_FFN_BATCH_B_MAX];
+        int32_t x_sum_list[EXPERT_FFN_BATCH_B_MAX];
+        float* out_list[EXPERT_FFN_BATCH_B_MAX];
+        for (int b = 0; b < B; ++b) {
+            const int task_idx = token_start + b;
+            const int t = sorted_token_ids[task_idx];
+            const int slot = sorted_slot_ids[task_idx];
+            xq_list[b] = xq_workspace + static_cast<size_t>(t) * MAX_D_MODEL;
+            s_x_list[b] = x_scale_workspace[t];
+            x_sum_list[b] = x_sum_workspace[t];
+            out_list[b] = expert_out_workspace +
+                          static_cast<size_t>(t) * slots * MAX_D_MODEL +
+                          static_cast<size_t>(slot) * MAX_D_MODEL;
+        }
+        expert_ffn_batch(w_gate, w_up, w_down, s_gate, s_up, s_down,
+                         xq_list, s_x_list, x_sum_list, out_list,
+                         B, d_model, d_ff);
+    }
+
+    combine_outputs(x, w, y, num_tokens);
 }
