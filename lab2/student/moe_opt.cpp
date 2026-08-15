@@ -721,7 +721,9 @@ static inline void expert_ffn_requant(
 // are placed at the far end of the code segment, isolating the per-task and
 // intra-FFN paths (S1/S2/S3) from icache pressure and code-layout shifts.
 // h/hq are stack-local so each thread gets its own copy (no race).
-__attribute__((noinline, cold))
+// NOTE: `cold` dropped — this is the HOT path for S3/S4. cold misled GCC
+// into code-size optimization and poor alignment.
+__attribute__((noinline))
 static void expert_ffn_batch(
     const uint8_t* __restrict w_gate,
     const uint8_t* __restrict w_up,
