@@ -445,10 +445,30 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | chunk 间 state 并行 | 死路 | 需 128×128 矩阵 scan, shared 放不下 |
 | @autotune 提交 OJ | 6 case 超时 0 分 | JIT 搜参超 5min walltime |
 
-### 当前最优 (f7b5cdb, OJ ~92 分)
-- 短序列 (T<=2048): 结合律版 DV=64/th=128/st=2, 3 case 超 FlashQLA (120/103/101 分)
-- 长序列 (T>2048): 物化W版 DV=128/th=256/st=1, 4 case ~0.58x FlashQLA (~74 分)
-- **110 分目标在当前 TileLang + MIG 环境下不可达** (需 2.4x 长序列加速, 所有已知方向已穷尽)
+### 当前最优 (466c000, OJ 93 分)
+- 短序列 (T<=2048): 结合律版 DV=64/th=128/st=2, 3 case 超 FlashQLA (120/102/101 分)
+- 长序列 (T>2048) per-case 分发:
+  - 小 grid (B*Hv<=4, 即 chain_equal/hidden-2): 物化W版 DV=64/th=128/st=2, grid 翻倍提 SM 占用
+    - chain_equal 0.53ms (95分), 比 DV=128 的 0.84ms(74分) 快 37%
+  - 大 grid (B*Hv>4): 物化W版 DV=128/th=256/st=1, 大 tile 最优
+    - long_low 3.16ms(74分), wide 4.14ms(74分), deep 4.85ms(74分), batch_split 2.40ms(76分)
+- **OJ 93 分**: 公开 89.4 + 隐藏 98.0, 12 case 全 PASS
+
+### per-case 分发调参细节 (chain_equal 专用)
+- chain_equal (B=1, Hv=4, T=8192): grid=4 (DV=128) 或 8 (DV=64)
+- 实测对比:
+  - matw DV=64/th=128/st=2 = 0.527ms (最优, OJ 95分)
+  - matw DV=64/th=256/st=1 = 0.652ms (慢, th=256 对 chain 无益)
+  - 结合律 DV=64/th=128/st=2 = 0.584ms (慢, matw 少一次 GEMM 更快)
+  - matw DV=128/th=256/st=1 = 0.84ms (慢, grid=4 SM 占用不足)
+- chain t100=0.498ms, 当前 0.53ms 差 6%, 已接近极限
+
+### OJ 分数演变
+| 版本 | OJ 分 | 关键变化 |
+|------|-------|---------|
+| 5d25f18 (DV=64 全局) | 92 | 长序列全 DV=64, chain 快但 long_low 慢(4.06ms) |
+| 95ba1d4 (DV=128 全局) | 89 | 长序列 DV=128, long_low 快(3.18)但 chain 慢(0.84ms) |
+| 466c000 (per-case) | 93 | chain DV=64 + 长序列 DV=128, 取两者最优 |
 
 ---
 
