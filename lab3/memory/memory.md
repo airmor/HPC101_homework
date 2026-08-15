@@ -412,6 +412,44 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - WY v2 已证明 T=[128,128] 超 shared 上限, 走不通
 - FLA `chunk_h_parallel` 两阶段 (partial + scan) 不适用 GDN delta rule
 
+### 2-WG producer 做 state-free GEMM (**PASS 但慢, 无收益**)
+- 思路: producer(ws1) 做 W=A@βγK, U=A@βV, ds=QKᵀ⊙gate (state-free GEMM), consumer(ws0) 做 state GEMM
+- threads=256 精度好 (不触发 wgmma), 全 PASS
+- **单 buffer 版** (DV=128): chain 1.32ms, long_low 5.22ms (比 matw 0.53/3.21 慢 1.6-2x)
+  - 根因: W/U/ds 单 buffer, producer/consumer 同 chunk 串行, 无重叠
+- **双 buffer 版** (DV=64, W/U/ds 双 buffer 真正重叠): chain 0.89ms, long_low 6.66ms
+  - 比 matw 仍慢: DV=64 TC 效率降 + warp-spec barrier 开销 > 重叠收益
+  - long_low 更慢 (512 chunks × barrier 开销累积)
+- **结论**: 2-WG GEMM 在 MIG 上性能不升反降, DV=64 TC 效率损失是主因
+- **回退**: 代码回退到 f7b5cdb 基线
+
+### TL_DISABLE_WGMMA pass_config (**无效**)
+- `tilelang.PassConfigKey.TL_DISABLE_WGMMA = "tl.disable_wgmma"` 存在
+- 4-WG threads=512 + TL_DISABLE_WGMMA=True: 仍 2.7% 精度差 (abs 0.069 不变)
+- 说明误差不是 wgmma vs mma 问题, 是多 WG 同步可见性
+- matw+T.serial 单 kernel PASS 证明: T.serial 本身不引入误差
+
+## 11. 优化方向穷尽总结 (截至 2026-08-15)
+
+### 已验证不可行
+| 方向 | 结果 | 根因 |
+|------|------|------|
+| 4-WG warp spec (T.ws) | 死锁 | T.ws(3) 不支持 |
+| 4-WG tx 手写 4 分支 | 2.7% 精度 | 多 WG 同步可见性 (wgmma async proxy) |
+| 4-WG + TL_DISABLE_WGMMA | 2.7% 不变 | 非 wgmma 问题 |
+| threads=512 matw | wide/deep FAIL | 精度回归 |
+| per-case 调参 | 无提升 | DV=128/th=256/st=1 已最优 |
+| split-DV (DV=64) | 全线更慢 | TC 效率损失 > grid 收益 |
+| 2-WG producer GEMM (单 buffer) | 慢 1.6-2x | 无重叠 (同 chunk 串行) |
+| 2-WG producer GEMM (双 buffer DV=64) | 慢 2x | DV=64 TC 降 + barrier 开销 |
+| chunk 间 state 并行 | 死路 | 需 128×128 矩阵 scan, shared 放不下 |
+| @autotune 提交 OJ | 6 case 超时 0 分 | JIT 搜参超 5min walltime |
+
+### 当前最优 (f7b5cdb, OJ ~92 分)
+- 短序列 (T<=2048): 结合律版 DV=64/th=128/st=2, 3 case 超 FlashQLA (120/103/101 分)
+- 长序列 (T>2048): 物化W版 DV=128/th=256/st=1, 4 case ~0.58x FlashQLA (~74 分)
+- **110 分目标在当前 TileLang + MIG 环境下不可达** (需 2.4x 长序列加速, 所有已知方向已穷尽)
+
 ---
 
 ## 7. 下一步优化方向
