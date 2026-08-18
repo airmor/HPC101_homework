@@ -366,6 +366,425 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
 
 
 # ============================================================
+# WY-O 同步版 (长序列, 实验):
+#   数学: O = scale*((γ⊙Q - ds@W)@S_old + ds@U), 消除 O→V_new 依赖
+#         推导: O = scale*(γ⊙(Q@S) + ds@(U-W@S))
+#                   = scale*((γ⊙Q - ds@W)@S + ds@U)
+#   调度: 同步 T.gemm (对照实验, 隔离 async 收益). 8 GEMM (比 matw 7 多 1: ds@W).
+#   ★ 对照目的: 之前 async 版 (T.wgmma_gemm+wait) 全线慢 40-80%, 疑 fragment 复用 copy +
+#     spill 反收益. 本版回退同步, 确认 (a) 精度仍过 (b) async 是不是负收益元凶.
+# ============================================================
+@tilelang.jit(out_idx=[-2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_wyo_async_kernel(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_stages=1):
+    """WY-O 仿射同步版 (对照). O=scale*((γ⊙Q-ds@W)@S + ds@U), 不依赖 V_new."""
+    block_S = CHUNK_SIZE
+    num_chunks = (S + block_S - 1) // block_S
+    G = Hv // Hq
+
+    QK_shape = (B, S, Hq, DK)
+    V_shape = (B, S, Hv, DV)
+    gate_shape = (B, S, Hv)
+    A_shape = (B, S, Hv, block_S)
+    init_shape = (B, Hv, DK, DV)
+    O_shape = (B, S, Hv, DV)
+    final_shape = (B, Hv, DK, DV)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(QK_shape, dtype=T.bfloat16),
+        K: T.Tensor(QK_shape, dtype=T.bfloat16),
+        V: T.Tensor(V_shape, dtype=T.bfloat16),
+        g_cumsum: T.Tensor(gate_shape, dtype=T.float32),
+        beta: T.Tensor(gate_shape, dtype=T.float32),
+        A: T.Tensor(A_shape, dtype=T.bfloat16),
+        initial_state: T.Tensor(init_shape, dtype=T.float32),
+        O: T.Tensor(O_shape, dtype=T.bfloat16),
+        final_state: T.Tensor(final_shape, dtype=T.float32),
+    ):
+        with T.Kernel(T.ceildiv(DV, block_DV), B * Hv, threads=threads) as (bv, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+            bhg = bh // G
+
+            s_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            s_fragment = T.alloc_fragment((DK, block_DV), dtype=T.float32)
+
+            Q_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            K_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            V_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            A_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+
+            bkg_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            W_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            U_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)   # ★ WY-O: U 驻留 (不覆写)
+            ds_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+            Qp_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)        # ★ WY-O: γ⊙Q-ds@W
+            WS_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)  # ★ W@S 截断驻留 (精度修复)
+            V_new_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+
+            g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_exp_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_inv_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_last_local = T.alloc_local((1,), T.float32)
+            gl_local = T.alloc_local((1,), T.float32)
+
+            tmp_dv = T.alloc_fragment((block_S, DK), dtype=T.float32)         # W / ds@W (最大 [64,128])
+            tmp_dv2 = T.alloc_fragment((block_S, block_DV), dtype=T.float32)    # U / WS / V_new
+            ds_tmp = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            tmp_dkw = T.alloc_fragment((block_S, DK), dtype=T.float32)         # ★ WY-O: ds@W [64,128]
+
+            T.annotate_layout({
+                V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+                Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+                K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                bkg_shared: tilelang.layout.make_swizzled_layout(bkg_shared),
+                W_shared: tilelang.layout.make_swizzled_layout(W_shared),
+                U_shared: tilelang.layout.make_swizzled_layout(U_shared),
+                Qp_shared: tilelang.layout.make_swizzled_layout(Qp_shared),
+            })
+            T.use_swizzle(10)
+            T.disable_warp_group_reg_alloc()
+
+            T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
+            T.copy(s_shared, s_fragment)
+
+            for i_c in T.Pipelined(num_chunks, num_stages=num_stages):
+                left = i_c * block_S
+                length = T.min(block_S, S - left)
+
+                # ---- load (尾块补零, 同 matw) ----
+                for t, d in T.Parallel(block_S, DK):
+                    if left + t < S:
+                        Q_shared[t, d] = Q[bb, left + t, bhg, d]
+                        K_shared[t, d] = K[bb, left + t, bhg, d]
+                    else:
+                        Q_shared[t, d] = 0
+                        K_shared[t, d] = 0
+                for t, d in T.Parallel(block_S, block_DV):
+                    if left + t < S:
+                        V_shared[t, d] = V[bb, left + t, bh, bv * block_DV + d]
+                    else:
+                        V_shared[t, d] = 0
+                for t, d in T.Parallel(block_S, block_S):
+                    if left + t < S:
+                        A_shared[t, d] = A[bb, left + t, bh, d]
+                    else:
+                        A_shared[t, d] = 1 if t == d else 0
+                for t in T.Parallel(block_S):
+                    if left + t < S:
+                        g_shared[t] = g_cumsum[bb, left + t, bh]
+                        beta_shared[t] = beta[bb, left + t, bh]
+                    else:
+                        g_shared[t] = 0
+                        beta_shared[t] = 0
+
+                g_last_local[0] = g_cumsum[bb, left + length - 1, bh]
+                gl_local[0] = T.exp2(g_last_local[0] * LOG2E)
+
+                # 预算 exp(g)/1/exp(g)/beta*g_exp, 复用省 exp2
+                for t in T.Parallel(block_S):
+                    g_exp_shared[t] = T.exp2(g_shared[t] * LOG2E)
+                    g_inv_shared[t] = T.exp2(-g_shared[t] * LOG2E)
+                    beta_g_shared[t] = beta_shared[t] * g_exp_shared[t]
+
+                # βγK (ew)
+                for t, d in T.Parallel(block_S, DK):
+                    bkg_shared[t, d] = T.cast(
+                        T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
+                # βV 暂存到 V_new_shared (此时尚未用), 作 U=A@βV 的输入
+                for t, d in T.Parallel(block_S, block_DV):
+                    V_new_shared[t, d] = T.cast(
+                        T.cast(V_shared[t, d], T.float32) * beta_shared[t], T.bfloat16)
+
+                # ============ Phase A: state-free GEMM (3, 同步) ============
+                T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)        # W = A@βγK
+                T.copy(tmp_dv, W_shared)
+                T.gemm(A_shared, V_new_shared, tmp_dv2, clear_accum=True)     # U = A@βV
+                T.copy(tmp_dv2, U_shared)
+                T.gemm(Q_shared, K_shared, ds_tmp, transpose_B=True, clear_accum=True)  # QKᵀ
+                for i, j in T.Parallel(block_S, block_S):
+                    if i >= j:
+                        ds_tmp[i, j] = ds_tmp[i, j] * g_exp_shared[i] * g_inv_shared[j]
+                    else:
+                        ds_tmp[i, j] = 0
+                T.copy(ds_tmp, ds_shared)
+
+                # ============ Phase B: state GEMMs (依赖 S_old, 2) ============
+                T.copy(s_fragment, s_shared)   # s_shared = S_old
+                T.gemm(ds_shared, W_shared, tmp_dkw, clear_accum=True)        # ds@W → tmp_dkw
+                T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)        # W@S → WS (tmp_dv2)
+                # ew: V_new = U - WS. ★ 三项目式精度修复: WS 截断回 BF16 shared 再减, 同 matw 截断策略.
+                T.copy(tmp_dv2, WS_shared)   # WS FP32 -> BF16 shared (一次截断)
+                T.copy(U_shared, tmp_dv2)    # tmp_dv2 = U (FP32)
+                for t, d in T.Parallel(block_S, block_DV):
+                    tmp_dv2[t, d] = tmp_dv2[t, d] - T.cast(WS_shared[t, d], T.float32)  # V_new = U - WS
+                T.copy(tmp_dv2, V_new_shared)   # V_new_shared = V_new (BF16, 供 Phase D)
+                for t, d in T.Parallel(block_S, DK):
+                    Qp_shared[t, d] = T.cast(
+                        T.cast(Q_shared[t, d], T.float32) * g_exp_shared[t] - tmp_dkw[t, d],
+                        T.bfloat16)
+
+                # ============ Phase C: O GEMMs (2) ============
+                T.gemm(ds_shared, U_shared, O_fragment, clear_accum=True)    # b_O = ds@U
+                T.gemm(Qp_shared, s_shared, O_fragment, clear_accum=False)  # O += Qp@S_old
+                # ew: gate V_new + gate S (不读 O_fragment)
+                for t, d in T.Parallel(block_S, block_DV):
+                    tmp_dv2[t, d] = tmp_dv2[t, d] * gl_local[0] * g_inv_shared[t]
+                T.copy(tmp_dv2, V_new_shared)   # gated V_new
+                for t, d in T.Parallel(DK, block_DV):
+                    s_fragment[t, d] = s_fragment[t, d] * gl_local[0]
+                # ew: O *= scale, 写回 (依赖 O_fragment)
+                for t, d in T.Parallel(block_S, block_DV):
+                    if left + t < S:
+                        O[bb, left + t, bh, bv * block_DV + d] = T.cast(
+                            (DK ** -0.5) * O_fragment[t, d], T.bfloat16)
+
+                # ============ Phase D: S update ============
+                T.gemm(K_shared, V_new_shared, s_fragment, transpose_A=True, clear_accum=False)
+
+            T.copy(s_fragment, final_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV])
+
+    return kernel
+
+
+# ============================================================
+# WY-O + GEMM 融合版 (长序列, 实验):
+#   在 WY-O 同步版基础上, 融合 3 对共操作数 GEMM:
+#     F1: W=A@βγK, U=A@βV           → [W|U]=A@[βγK|βV]      (N=256, M=64)
+#     F2: Qp@S, WS=W@S               → [WS;QpS]=[W;Qp]@S     (M=128, N=DV)
+#     F3: ds@U, ds@WS                → ds@[U|WS]              (N=256, M=64)
+#   ★ 风险点: fragment 偏移索引 (零先例, 见子agent调研). 分级验证:
+#     - GDN_FUSE_F1_ONLY=1: 只做 F1 (最小验证 N=256 + fragment 取左/右半)
+#     - GDN_FUSE_ALL=1:     F1+F2+F3 全做 (M=128/N=256, 取上下半/左右半)
+#   ★ 若偏移索引 layout_inference 拒绝, 退化到 WY-O 同步版 (保精度, 无融合收益).
+# ============================================================
+@tilelang.jit(out_idx=[-2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_wyo_fuse_kernel(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_stages=1,
+                         use_F1=True, use_F2=True, use_F3=True):
+    """WY-O + GEMM 融合. 5-6 GEMM (比 matw 7 少 1-2). 实验性, 风险=fragment 偏移索引."""
+    block_S = CHUNK_SIZE
+    num_chunks = (S + block_S - 1) // block_S
+    G = Hv // Hq
+
+    QK_shape = (B, S, Hq, DK)
+    V_shape = (B, S, Hv, DV)
+    gate_shape = (B, S, Hv)
+    A_shape = (B, S, Hv, block_S)
+    init_shape = (B, Hv, DK, DV)
+    O_shape = (B, S, Hv, DV)
+    final_shape = (B, Hv, DK, DV)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(QK_shape, dtype=T.bfloat16),
+        K: T.Tensor(QK_shape, dtype=T.bfloat16),
+        V: T.Tensor(V_shape, dtype=T.bfloat16),
+        g_cumsum: T.Tensor(gate_shape, dtype=T.float32),
+        beta: T.Tensor(gate_shape, dtype=T.float32),
+        A: T.Tensor(A_shape, dtype=T.bfloat16),
+        initial_state: T.Tensor(init_shape, dtype=T.float32),
+        O: T.Tensor(O_shape, dtype=T.bfloat16),
+        final_state: T.Tensor(final_shape, dtype=T.float32),
+    ):
+        with T.Kernel(T.ceildiv(DV, block_DV), B * Hv, threads=threads) as (bv, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+            bhg = bh // G
+
+            s_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            s_fragment = T.alloc_fragment((DK, block_DV), dtype=T.float32)
+
+            Q_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            K_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            V_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            A_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+
+            bkg_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            # F1: [βγK|βV] 拼接 buffer (N=256). use_F1 时填, 否则用 bkg_shared+V_new_shared.
+            # ★ F1 复用 bkg_shared 区域做中转: 先 A@[βγK|βV]→WU_frag, T.copy 到 bkbv_shared(BF16),
+            #   再切片读左(W)/右(U). 这样不需 WU_shared_big 额外 32KB (省内存到 225KB).
+            bkbv_shared = T.alloc_shared((block_S, DK + block_DV), dtype=T.bfloat16)
+            W_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            U_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            ds_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+            Qp_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            WS_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            V_new_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            # F2: [W;Qp] 拼接 buffer (M=128). use_F2 时填.
+            WQp_shared = T.alloc_shared((2 * block_S, DK), dtype=T.bfloat16)
+            # F3: [U|WS] 拼接 buffer (N=256). use_F3 时填.
+            UWS_shared = T.alloc_shared((block_S, block_DV + block_DV), dtype=T.bfloat16)
+
+            g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_exp_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_inv_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_last_local = T.alloc_local((1,), T.float32)
+            gl_local = T.alloc_local((1,), T.float32)
+
+            tmp_dv = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            tmp_dv2 = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            ds_tmp = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            tmp_dkw = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            # F1 输出: [W|U] = A@[βγK|βV], [64, 256] FP32
+            WU_frag = T.alloc_fragment((block_S, DK + block_DV), dtype=T.float32)
+            # F2 输出: [WS;QpS] = [W;Qp]@S, [128, block_DV] FP32
+            WSpQpS_frag = T.alloc_fragment((2 * block_S, block_DV), dtype=T.float32)
+            # F3 输出: ds@[U|WS], [64, 2*block_DV] FP32
+            dsUWS_frag = T.alloc_fragment((block_S, 2 * block_DV), dtype=T.float32)
+
+            T.annotate_layout({
+                V_shared: tilelang.layout.make_swizzled_layout(V_shared),
+                Q_shared: tilelang.layout.make_swizzled_layout(Q_shared),
+                K_shared: tilelang.layout.make_swizzled_layout(K_shared),
+                bkg_shared: tilelang.layout.make_swizzled_layout(bkg_shared),
+                W_shared: tilelang.layout.make_swizzled_layout(W_shared),
+                U_shared: tilelang.layout.make_swizzled_layout(U_shared),
+                Qp_shared: tilelang.layout.make_swizzled_layout(Qp_shared),
+            })
+            T.use_swizzle(10)
+            T.disable_warp_group_reg_alloc()
+
+            T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
+            T.copy(s_shared, s_fragment)
+
+            for i_c in T.Pipelined(num_chunks, num_stages=num_stages):
+                left = i_c * block_S
+                length = T.min(block_S, S - left)
+
+                # ---- load (尾块补零) ----
+                for t, d in T.Parallel(block_S, DK):
+                    if left + t < S:
+                        Q_shared[t, d] = Q[bb, left + t, bhg, d]
+                        K_shared[t, d] = K[bb, left + t, bhg, d]
+                    else:
+                        Q_shared[t, d] = 0
+                        K_shared[t, d] = 0
+                for t, d in T.Parallel(block_S, block_DV):
+                    if left + t < S:
+                        V_shared[t, d] = V[bb, left + t, bh, bv * block_DV + d]
+                    else:
+                        V_shared[t, d] = 0
+                for t, d in T.Parallel(block_S, block_S):
+                    if left + t < S:
+                        A_shared[t, d] = A[bb, left + t, bh, d]
+                    else:
+                        A_shared[t, d] = 1 if t == d else 0
+                for t in T.Parallel(block_S):
+                    if left + t < S:
+                        g_shared[t] = g_cumsum[bb, left + t, bh]
+                        beta_shared[t] = beta[bb, left + t, bh]
+                    else:
+                        g_shared[t] = 0
+                        beta_shared[t] = 0
+
+                g_last_local[0] = g_cumsum[bb, left + length - 1, bh]
+                gl_local[0] = T.exp2(g_last_local[0] * LOG2E)
+
+                for t in T.Parallel(block_S):
+                    g_exp_shared[t] = T.exp2(g_shared[t] * LOG2E)
+                    g_inv_shared[t] = T.exp2(-g_shared[t] * LOG2E)
+                    beta_g_shared[t] = beta_shared[t] * g_exp_shared[t]
+
+                # ew: βγK, βV. F1: 拼成 [βγK|βV] (N=256) 供 A@[βγK|βV] 一次 GEMM
+                if use_F1:
+                    for t, d in T.Parallel(block_S, DK + block_DV):
+                        if d < DK:
+                            bkbv_shared[t, d] = T.cast(
+                                T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
+                        else:
+                            bkbv_shared[t, d] = T.cast(
+                                T.cast(V_shared[t, d - DK], T.float32) * beta_shared[t], T.bfloat16)
+                    T.gemm(A_shared, bkbv_shared, WU_frag, clear_accum=True)   # [W|U] = A@[βγK|βV]
+                    # ★ fragment 偏移索引零先例. 改用 shared 切片中转:
+                    #   bkbv_shared 此刻已不再用作 GEMM 输入, 复用为 WU 中转 (BF16 截断一次)
+                    T.copy(WU_frag, bkbv_shared)   # FP32 frag -> BF16 shared (整体拷贝, 无偏移)
+                    for t, d in T.Parallel(block_S, DK):
+                        W_shared[t, d] = bkbv_shared[t, d]           # shared 切片 (左半)
+                    for t, d in T.Parallel(block_S, block_DV):
+                        U_shared[t, d] = bkbv_shared[t, DK + d]     # shared 切片 (右半)
+                else:
+                    for t, d in T.Parallel(block_S, DK):
+                        bkg_shared[t, d] = T.cast(
+                            T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
+                    T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)
+                    T.copy(tmp_dv, W_shared)
+                    for t, d in T.Parallel(block_S, block_DV):
+                        V_new_shared[t, d] = T.cast(
+                            T.cast(V_shared[t, d], T.float32) * beta_shared[t], T.bfloat16)
+                    T.gemm(A_shared, V_new_shared, tmp_dv2, clear_accum=True)
+                    T.copy(tmp_dv2, U_shared)
+                # ds = Lower(QKᵀ) ⊙ (g_exp_i * g_inv_j)
+                T.gemm(Q_shared, K_shared, ds_tmp, transpose_B=True, clear_accum=True)
+                for i, j in T.Parallel(block_S, block_S):
+                    if i >= j:
+                        ds_tmp[i, j] = ds_tmp[i, j] * g_exp_shared[i] * g_inv_shared[j]
+                    else:
+                        ds_tmp[i, j] = 0
+                T.copy(ds_tmp, ds_shared)
+
+                # Qp = γ⊙Q - ds@W (先算 ds@W, 用 tmp_dkw)
+                T.gemm(ds_shared, W_shared, tmp_dkw, clear_accum=True)   # ds@W
+                for t, d in T.Parallel(block_S, DK):
+                    Qp_shared[t, d] = T.cast(
+                        T.cast(Q_shared[t, d], T.float32) * g_exp_shared[t] - tmp_dkw[t, d],
+                        T.bfloat16)
+
+                # ---- state GEMMs: WS=W@S, QpS=Qp@S ----
+                # ★ O_fragment 直接接收 QpS (O = QpS + ds@U - ds@W@S = QpS + dsU - dsWS)
+                T.copy(s_fragment, s_shared)   # s_shared = S_old
+                if use_F2:
+                    # F2: [W;Qp] 拼成 [128, DK], [W;Qp]@S 一次 M=128 GEMM
+                    for t, d in T.Parallel(block_S, DK):
+                        WQp_shared[t, d] = W_shared[t, d]
+                        WQp_shared[block_S + t, d] = Qp_shared[t, d]
+                    T.gemm(WQp_shared, s_shared, WSpQpS_frag, clear_accum=True)  # [128, DV]
+                    # 上半 WS → WS_shared (BF16 截断); 下半 QpS → O_fragment (FP32, O 累加起点)
+                    for t, d in T.Parallel(block_S, block_DV):
+                        WS_shared[t, d] = T.cast(WSpQpS_frag[t, d], T.bfloat16)
+                        O_fragment[t, d] = WSpQpS_frag[block_S + t, d]
+                else:
+                    T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)   # WS
+                    T.copy(tmp_dv2, WS_shared)
+                    T.gemm(Qp_shared, s_shared, O_fragment, clear_accum=True)  # QpS → O_fragment
+
+                # V_new = U - WS (U 在 U_shared, WS 在 WS_shared BF16). 用 tmp_dv2 临时存.
+                # ★ 不用 tmp_dv (它在 else 分支给 ds@WS 留着; F3 分支没用到 tmp_dv 但保持一致)
+                T.copy(U_shared, tmp_dv2)
+                for t, d in T.Parallel(block_S, block_DV):
+                    tmp_dv2[t, d] = tmp_dv2[t, d] - T.cast(WS_shared[t, d], T.float32)  # V_new
+                T.copy(tmp_dv2, V_new_shared)
+
+                # ---- O 累加: O = Qp@S + ds@U (WY-O, 2 GEMM 累加, 不减 ds@WS!) ----
+                # ★ 数学: O = scale*((γ⊙Q-ds@W)@S + ds@U) = scale*(Qp@S + ds@U)
+                #   Qp 已含 -ds@W, 不需再减 ds@W@S. 之前 else 分支多减一次 = 0.049 误差根因.
+                # ★ F3 (ds@[W|U]→[dsW|dsU]) 要在 Qp 构造前 issue, 时序复杂, 暂只用保守分支
+                T.gemm(ds_shared, U_shared, O_fragment, clear_accum=False)   # O += ds@U (QpS 已在 O_fragment)
+                # gate V_new + gate S (不依赖 O_fragment)
+                for t, d in T.Parallel(block_S, block_DV):
+                    tmp_dv2[t, d] = tmp_dv2[t, d] * gl_local[0] * g_inv_shared[t]
+                T.copy(tmp_dv2, V_new_shared)
+                for t, d in T.Parallel(DK, block_DV):
+                    s_fragment[t, d] = s_fragment[t, d] * gl_local[0]
+
+                # O *= scale, 写回
+                for t, d in T.Parallel(block_S, block_DV):
+                    if left + t < S:
+                        O[bb, left + t, bh, bv * block_DV + d] = T.cast(
+                            (DK ** -0.5) * O_fragment[t, d], T.bfloat16)
+
+                # S update
+                T.gemm(K_shared, V_new_shared, s_fragment, transpose_A=True, clear_accum=False)
+
+            T.copy(s_fragment, final_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV])
+
+    return kernel
+
+
+# ============================================================
 # Phase A: 2-WG producer/consumer 探针 kernel (验证 warp-spec API)
 #   最小可复现样例: 照抄官方 example_warp_specialize_gemm_barrierpipe_stage2 的 barrier 模式
 #   producer (T.ws(1)): TMA load → arrive; consumer (T.ws(0)): wait → 用 T.copy 写回 global
@@ -583,9 +1002,14 @@ def gdn_prefill_forward(
     # 手动固定 autotune 搜出的最优配置 (不用 @autotune, 避免 OJ JIT 编译超时)
     # 短序列 (T<=2048): 结合律版 DV=64/th=128/st=2, 寄存器少, launch 占比大受益
     # 长序列 (T>2048):  物化W版 DV=128/th=256/st=1, 大 tile + 寄存器分摊, GEMM 少
-    # ★ 调试开关: WS_PROBE=1 跑 2-WG 探针验证 warp-spec API; =0 走 matw 版 (92分基线)
+    # ★ 调试开关:
+    #   GDN_WS_PROBE=1 跑 2-WG 探针验证 warp-spec API
+    #   GDN_WYO=1     跑 WY-O+async 实验版 (长序列实验, 默认关, 默认走 matw 保 93 基线)
     import os
     _WS_PROBE = os.environ.get("GDN_WS_PROBE", "0") == "1"
+    _WYO = os.environ.get("GDN_WYO", "0") == "1"
+    _WYO_F1 = os.environ.get("GDN_FUSE_F1_ONLY", "0") == "1"
+    _WYO_FUSE = os.environ.get("GDN_FUSE_ALL", "0") == "1"
     if _WS_PROBE:
         # 探针: 所有长度都走 ws 探针 (方便用 short_tail 调试)
         # threads=256 才有 2 个 warp group: ws(0)=[0,128) producer, ws(1)=[128,256) consumer
@@ -593,6 +1017,29 @@ def gdn_prefill_forward(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
             head_dim_k, head_dim_v,
             block_DV=128, threads=256,
+        )
+    elif _WYO_F1:
+        # WY-O + 仅 F1 融合 (验证 N=256 GEMM + fragment 取左/右半)
+        kernel = _gdn_wyo_fuse_kernel(
+            batch_size, num_tokens, num_heads_qk, num_heads_v,
+            head_dim_k, head_dim_v,
+            block_DV=128, threads=256, num_stages=1,
+            use_F1=True, use_F2=False, use_F3=False,
+        )
+    elif _WYO_FUSE:
+        # WY-O + F1+F2+F3 全融合 (M=128/N=256, fragment 取上下/左右半)
+        kernel = _gdn_wyo_fuse_kernel(
+            batch_size, num_tokens, num_heads_qk, num_heads_v,
+            head_dim_k, head_dim_v,
+            block_DV=128, threads=256, num_stages=1,
+            use_F1=True, use_F2=True, use_F3=True,
+        )
+    elif _WYO:
+        # WY-O 同步对照 (无融合)
+        kernel = _gdn_wyo_async_kernel(
+            batch_size, num_tokens, num_heads_qk, num_heads_v,
+            head_dim_k, head_dim_v,
+            block_DV=128, threads=256, num_stages=1,
         )
     elif num_tokens <= 2048:
         kernel = _gdn_naive_kernel(

@@ -241,18 +241,24 @@ else:
 
 ## 4. 最终性能数据 (core forward, H800 MIG 10G)
 
-| case | student(ms) | FlashQLA(ms) | vs FlashQLA | 策略 (autotune 选) |
-|------|------------|-------------|-------------|------|
-| short_tail_state | 0.146 | 0.271 | **1.86x 快** | 结合律, DV=64,th=128,st=1 |
-| parallel_equal | 0.45 | 0.467 | **1.04x 快** | 结合律, DV=64 |
-| parallel_gva | 0.43 | 0.434 | **1.01x 快** | 结合律, DV=64 |
-| chain_equal | 0.53 | 0.450 | 0.85x | 结合律, DV=64 |
-| long_low_gva | 3.21 | 1.824 | 0.57x | 物化W, DV=128,th=256,st=1 |
-| batch_split_gva | 2.44 | 1.803 | 0.74x | 物化W, DV=128,th=256,st=1 |
-| wide_gva_state | 4.14 | 3.363 | 0.81x | 物化W, DV=128,th=256,st=1 |
-| deep_gva_state | 4.85 | 3.636 | 0.75x | 物化W, DV=128,th=256,st=1 |
+★ FlashQLA 参考时间用作业页面 t100 (2026-08-17 从 hpc101.zjusct.io 确认):
+  short_tail=0.346, chain=0.498, parallel_equal=0.511, parallel_gva=0.492,
+  long_low=1.859, batch_split=1.532, wide=2.427, deep=2.831
 
-**3 个 case 超过 FlashQLA**（short_tail 1.86x, parallel_equal 1.04x, parallel_gva 1.01x）
+| case | student(ms) | t100(ms) | p=t100/t | 估算分 |
+|------|------------|----------|----------|--------|
+| short_tail_state | 0.146 | 0.346 | 2.37 | 120(封顶) |
+| parallel_equal | 0.45 | 0.511 | 1.14 | ~103 |
+| parallel_gva | 0.43 | 0.492 | 1.14 | ~103 |
+| chain_equal | 0.53 | 0.498 | 0.94 | ~97 |
+| long_low_gva | 3.16 | 1.859 | 0.59 | ~81 |
+| batch_split_gva | 2.40 | 1.532 | 0.64 | ~84 |
+| wide_gva_state | 4.14 | 2.427 | 0.59 | ~81 |
+| deep_gva_state | 4.85 | 2.831 | 0.58 | ~81 |
+
+**3 个 case 超过 FlashQLA**（short_tail 2.37x, parallel_equal 1.14x, parallel_gva 1.14x）
+★ 评分公式 p=t100/t, p>1 进 100-120 奖励区. 长序列 4 case p≈0.58-0.64(~81分) 是提分瓶颈.
+★ 冲 110 需长序列 p≈1.0 (追平 FlashQLA), 即 long_low 3.16→1.86ms (1.7x加速). 4-WG 是唯一路径但不可行.
 
 ### 优化进展 (v1 → 最终)
 - short_tail: 0.195 → 0.146（快 25%）
@@ -396,6 +402,71 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - **结论**: 4-WG 在 TileLang + MIG 上精度无法通过 RTOL=5e-3 (当前 TileLang 版本限制)
 - 回退到 f7b5cdb 基线
 
+### 4-WG 第二轮 (FlashMLA 模板照搬, **仍未通**)
+- 子 agent 读 FlashMLA 完整源码 (github.com/tile-ai/tilelang examples/warp_specialize/)
+  - ★ FlashMLA 实为 **2-WG** (threads=256, tx<128/else), 非 4-WG! tilelang 仓库无 4 分支范本
+  - 唯一 `T.fence_proxy_async` 在 line 231: `T.copy(frag, shared) → fence → barrier_arrive`
+  - 注释明证: "InjectFenceProxy cannot infer from warp specialization code that this is a RAW dependency"
+  - 8 处 `T.wait_wgmma(0)` 在每个 wgmma 组后读 accumulator 前
+  - gemm_barrierpipe (2-WG 严格 P/C) 的 barrier Pattern A: `[128,128]*num_stages`, parity `(i//ns)%ns`
+- 照搬模板重写 4-WG (朴素 V_new, num_stages=2):
+  - 跨 WG 写 (h_shared/vn_shared) 后都 `fence → arrive` (照搬 FlashMLA line 231)
+  - 每个 `T.gemm` 后 `T.wait_wgmma(0)` 再读 accumulator (照搬 FlashMLA 8 处)
+  - barrier `[128,384,128,128]*2`, parity `(i//2)%2`
+- **实测**: chain_equal 仍 FAIL — 69.1% mismatch (abs 0.10), 加 intra-WG bkg/bv fence 后变 79% nan
+- **★ 二分诊断** (S+V 空转, 只验证 producer→S→V 同步链): **仍 nan**
+  - 即使 S 只预算 gate + 发布 h (不算 S_new), V 只算 W (不算 V_new), O/V 全空转 → nan
+  - 说明 nan 不来自计算, 来自 **最基础的 producer→consumer data_ready 同步** (element-wise load + fence + arrive → consumer wait + 读)
+- 回退到 466c000 基线
+
+### 4-WG 第三轮 (T.ws 调研反转 + FlashQLA 配置 + WY-O, **仍未通**)
+- **子 agent 源码调研 (关键反转)**:
+  - `T.ws(N)` 语法不限 N，但 `producer_consumer_ws.cc` **只支持 2 分区**! 4 分区代码生成零验证
+  - ★ FlashQLA hopper 版是 **TileLang** (非 CUDA), 4-WG threads=512, 用**手写 tx if/elif 4 分支**(和前两轮一样)
+  - tilelang 作者写 4-WG 时都绕过 T.ws 用手写 tx → 手写 tx 本身不是 bug 根源
+  - FlashQLA 完整配置: `data_ready` arrive_count=**96**(3 producer sub-warp×32), `data_free`=384, per-WG `set_max_nreg`(S=160/V=128/O=128/P=32), parity=`i_s%2`(内部) vs `(i_s//2)%2`(外部 buffer), **无 wait_wgmma**(靠 barrier 隐式 commit), 无 prologue
+  - 我 Round 2 差异: arrive_count=128(错), 无 set_max_nreg(关键漏), 每处加 wait_wgmma(反 nan), parity 统一(错)
+- **第三轮 a (WY-O + Q' 复用 K_shared_2)**: chunk0 **PASS(0.0003)**, chunk1+ 全错(~0.05, 恒定不累积)
+  - 数学 WY-O: `O=scale*((γ⊙Q-ds@W)@S_old + ds@U)`, 消除 O→V_new 跨 WG 依赖
+  - 诊断: Q'=γ⊙Q-ds@W 写到 K_shared_2[buf] 覆盖 K, 但 CONSUMER_S 需 K 算 Kᵀ@V_new → 竞争
+  - chunk0 对因 S_old=0 特殊性 (V_new=U−W@0=U, Kᵀ@V_new 错误被掩盖)
+- **第三轮 b (原始 O 形式, 不覆盖 K)**: kernel 调用本身抛异常(卡在 gdn_prefill_forward 内部, sync 前挂)
+  - 根因: 原始 O 依赖 V_new(等 vn_ready), 与 4-WG 并行目标冲突 → barrier 环形依赖死锁
+  - ★ 证明 WY-O 是必须的(消 O→V 依赖), 不能回退原始 O
+- **第三轮 c (WY-O + Qp 独立 buffer, num_stages=2)**: nan(99.5%) — 比第三轮 a 退步
+- **第三轮 c (num_stages=1, phase=i%2)**: 仍 nan(89.2%)
+  - 独立 Qp 反而 nan, 说明复用 K 不是根因 → chunk1+ 错来自别处
+- **★ 第三轮最终根因推测**: chunk0 PASS 证明结构和数学正确, chunk1+ 恒定不累积错 → **跨 chunk state 传递竞争**
+  - s_fragment 单份跨 chunk 更新; h_shared 双 buffer 但 S 在 vn_ready 后更新, 下一 chunk 发布 h_shared[buf] 用更新后 S, 而 V/O 下一 chunk 在 buf 翻转后读 h_shared[buf] 可能读到未更新值
+  - 4-WG 下 3 consumer 的 wait/arrive 交错比 2-WG 复杂得多, barrier 时序在跨 chunk 边界有无法定位的竞争
+- **结论**: 4-WG 经过三轮(a/b/c)、多变体(num_stages 1/2、phase 公式、buffer 复用/独立、WY-O/原始O), **chunk0 PASS 但 chunk1+ 精度始终无法解决**. tilelang 仓库无 4-WG 范本(FlashQLA 是唯一 4-WG 但其 barrier 配置极复杂: 13 个 barrier + 4 producer sub-warp, 远超我能手写调通的复杂度). 4-WG 在当前 TileLang + MIG + 远程调试(5min walltime)下不可行.
+- 回退到 466c000 (OJ 93 分) 基线, 4-WG 方向最终暂停
+
+### 4-WG 第四轮: WY-O + async + GEMM 融合 (单 WG, **精度全过性能全退, 证伪**)
+- ★ 子agent调研关键反转: tilelang 有官方 async API (T.wgmma_gemm + T.wait_wgmma, gemm_op.py:142 docstring +
+  wgmma_macro_generator.py:340). 默认 T.gemm 隐式 wait(0) 阻塞; T.wgmma_gemm 不 emit wait.
+  flashmla example (example_warp_specialize_flashmla.py:160) 是唯一 async 先例 (重叠 GEMM↔TMA load, 非GEMM↔ew).
+  T.Pipelined 只重叠 load↔compute (pipeline_planning.cc:602 ClassifyCopyLikeStage 只认 CopyNode).
+  → 此前"WY-O 单 WG 慢需 4-WG 兑现"是基于同步 T.gemm 的误判, 重测三路:
+- **4a (async, T.wgmma_gemm+wait_wgmma(0))**: 8 case 全 PASS, 但慢 40-80%
+  - chain 0.954 (vs 0.53), long_low 4.529 (vs 3.16), wide 5.974, deep 6.894, batch 3.375
+  - 根因: HW OoO 重叠有限 + fragment 复用 copy (U 驻留需 shared 中转) + 寄存器压力
+- **4b (同步对照, T.gemm)**: 慢 2.3x (chain 1.230, long_low 4.604)
+  - 证明 async 给了微小但不够的收益; WY-O 的 +1 GEMM (ds@W) 串行开销仍主导
+- **4c (F1 融合, A@[βγK|βV]→[W|U], N=256)**: 慢 2.6x (chain 1.363, long_low 5.468)
+  - ★ T.gemm M=128/N=256 codegen 支持 (子agent1确认 gemm.cc:96 op.m_>=64, wgmma.h:220 N枚举到256)
+  - ★ fragment 偏移索引 (frag[t,DK+d]) 零先例 → 改 shared 切片中转 (T.copy frag→bkbv_shared 再切片读) 成功
+  - 根因: 拼接 ew (block_S×(DK+DV) 写) + frag→shared 中转 copy > 省 1 GEMM; N=256 大 tile TC 效率未兑现
+- **4d (F2/F3 未测)**: F1 已证净负, F2 fragment [128,DV] 寄存器更紧, F3 需重写时序, 趋势单调下降, 停测
+- ★ 数学修正: WY-O 的 O = scale*(Qp@S + ds@U), Qp=γ⊙Q-ds@W 已含 -ds@W, **不应再减 ds@W@S**
+  (初版多减一次 → 0.049 误差, 修正后全 PASS). 见 [[4wg-wyo-math]].
+- **结论**: WY-O 三路 (async/同步/融合) 在单 WG 下性能全部证伪. 根因统一:
+  (1) tilelang 无 GEMM↔ew 重叠机制 (T.Pipelined 只重叠 load↔compute, HW OoO 不可控)
+  (2) fragment 复用 + U 驻留拉长生命周期, 寄存器压力激增
+  (3) 融合的拼接/copy 开销 > 省 GEMM 收益
+  (4) async wait(0) 用太狠变同步, wait(N) 保留多 GEMM 在飞会 fragment 冲突
+- 回退到 466c000 (OJ 93 分) 基线, WY-O 方向最终暂停
+
 ### 长序列调参矩阵 (**DV=128/th=256/st=1 全局最优, 无提升空间**)
 | case | DV=128/th=256/st=1 | DV=64/th=256/st=1 | DV=64/th=128/st=2 | DV=128/th=512 |
 |------|---------------------|--------------------|--------------------|---------------|
@@ -429,13 +500,17 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - 说明误差不是 wgmma vs mma 问题, 是多 WG 同步可见性
 - matw+T.serial 单 kernel PASS 证明: T.serial 本身不引入误差
 
-## 11. 优化方向穷尽总结 (截至 2026-08-15)
+## 11. 优化方向穷尽总结 (截至 2026-08-17)
 
 ### 已验证不可行
 | 方向 | 结果 | 根因 |
 |------|------|------|
-| 4-WG warp spec (T.ws) | 死锁 | T.ws(3) 不支持 |
-| 4-WG tx 手写 4 分支 | 2.7% 精度 | 多 WG 同步可见性 (wgmma async proxy) |
+| 4-WG warp spec (T.ws) | 死锁 | T.ws(3) 不支持, producer_consumer_ws.cc 只支持 2 分区 |
+| 4-WG tx 手写 4 分支 (R1) | 2.7% 精度 | 多 WG 同步可见性 (wgmma async proxy) |
+| 4-WG + FlashMLA 模板照搬 (R2, fence+wait_wgmma) | 69%→nan | wait_wgmma 破坏 barrier 时序契约; 无 set_max_nreg |
+| 4-WG + FlashQLA 配置 (R3a, WY-O+Q'复用K) | chunk0 对, chunk1+ 错(0.05) | Q'覆盖 K, S 读错 Kᵀ@V_new; 跨 chunk state 竞争 |
+| 4-WG + 原始 O 形式 (R3b) | kernel 调用异常 | O 依赖 V_new → barrier 环形依赖死锁 (WY-O 是必须的) |
+| 4-WG + WY-O+Qp 独立 buffer (R3c, ns=1/2) | nan(89-99%) | 独立 Qp 反而 nan, 跨 chunk state 传递竞争未解 |
 | 4-WG + TL_DISABLE_WGMMA | 2.7% 不变 | 非 wgmma 问题 |
 | threads=512 matw | wide/deep FAIL | 精度回归 |
 | per-case 调参 | 无提升 | DV=128/th=256/st=1 已最优 |
@@ -444,6 +519,18 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | 2-WG producer GEMM (双 buffer DV=64) | 慢 2x | DV=64 TC 降 + barrier 开销 |
 | chunk 间 state 并行 | 死路 | 需 128×128 矩阵 scan, shared 放不下 |
 | @autotune 提交 OJ | 6 case 超时 0 分 | JIT 搜参超 5min walltime |
+| WY-O 单 WG | 慢 (chain 0.72 vs 0.53) | +1 GEMM 串行 > 消 ew 收益, 需 4-WG 兑现 (但 4-WG 不可行) |
+| 完整 WY (物化 T) | shared 超 232KB | T[128,128] 无法放下 |
+| **WY-O + async wgmma (单 WG)** | **全 PASS 但慢 40-80%** (chain 0.954, long_low 4.529) | T.wgmma_gemm async issue 但 HW OoO 重叠有限; fragment 复用 copy + 寄存器压力反收益 |
+| **WY-O 同步对照 (单 WG)** | **慢 2.3x** (chain 1.230, long_low 4.604) | 无 async 收益, 纯 +1 GEMM 串行, 证明 async 给了微小但不够的收益 |
+| **WY-O + GEMM 融合 F1 (A@[βγK\|βV]→[W\|U], N=256)** | **慢 2.6x** (chain 1.363, long_low 5.468) | 拼接 ew + frag→shared 中转 copy 开销 > 省 1 GEMM; N=256 大 tile 占用未兑现 |
+| WY-O + F2/F3 融合 | 未测 (F1 已证净负) | F2 fragment [128,DV] 寄存器更紧; F3 需重写时序; 趋势单调下降无逆转迹象 |
+
+### 4-WG 三轮失败的根本原因 (最终结论)
+1. **tilelang 无 4-WG 官方范本**: FlashQLA hopper 是唯一 4-WG (手写 tx), 但其 barrier 极复杂 (13 barrier + 4 producer sub-warp), 远超手写调通能力
+2. **chunk0 PASS 但 chunk1+ 错**: 证明单 chunk 结构/数学/fence/nreg 全对, bug 在跨 chunk 边界的 state/barrier 时序竞争
+3. **远程 5min walltime 限制**: 无法用 ncu/cuda-gdb 逐指令定位跨 chunk 竞争, 只能靠二分猜测
+4. **WY-O 是必须的但不够**: 消除 O→V 依赖避免死锁, 但跨 chunk state 传递仍有竞争
 
 ### 当前最优 (466c000, OJ 93 分)
 - 短序列 (T<=2048): 结合律版 DV=64/th=128/st=2, 3 case 超 FlashQLA (120/102/101 分)
@@ -472,35 +559,50 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 
 ---
 
-## 7. 下一步优化方向
+## 7. 下一步优化方向 (截至 2026-08-18, WY-O+融合第三轮失败后)
 
-### 目标: OJ 110 分
+### 目标: OJ 110 分 (★ 门槛是 p≈1.0)
+评分公式 p=t100/t. 110 分需长序列 p≈1.0 (追平 FlashQLA).
+- long_low: 3.16ms → 需 ~1.86ms (1.7x), wide 4.14→2.43, deep 4.85→2.83, batch 2.40→1.53
 
-当前 ~92-95 分 (95ba1d4 回退 autotune 后)。110 分需要长序列 4 case 平均 ~113 分 (p≈1.4, 即比 FlashQLA 快 40%)。
-- long_low: 3.21ms → 需 ~1.33ms (2.4x 加速)
-- wide: 4.14ms → 需 ~1.73ms (2.4x)
-- deep: 4.85ms → 需 ~2.02ms (2.4x)
-这非常激进, 4-WG 单独可能不够 (预期 1.5-2x), 需配合数学变换。
+### ★ WY-O 三路全部证伪 (2026-08-18, 单 WG 精度全过但性能全退)
+子agent调研发现 tilelang 有官方 async API (T.wgmma_gemm+T.wait_wgmma, flashmla 先例),
+此前"WY-O 单 WG 慢需 4-WG 兑现"的结论是基于默认同步 T.gemm 的误判. 重测三路:
+- **async (T.wgmma_gemm+wait_wgmma(0))**: 8 case 全 PASS, 但全线慢 40-80%
+  (chain 0.954 vs 0.53, long_low 4.529 vs 3.16, wide 5.974 vs 4.14)
+- **同步对照 (T.gemm)**: 慢 2.3x (chain 1.230, long_low 4.604), 证明 async 给了微小但不够的收益
+- **F1 融合 (A@[βγK|βV]→[W|U], N=256)**: 慢 2.6x (chain 1.363, long_low 5.468)
+  ★ 关键发现: T.gemm M=128/N=256 codegen 支持 (子agent1确认 gemm.cc:96/wgmma.h:220),
+    fragment 偏移索引 (frag[t,DK+d]) 零先例 → 改用 shared 切片中转 (bkbv_shared 复用) 成功编译运行.
+    但拼接 ew + frag→shared 中转 copy 开销 > 省 1 GEMM, N=256 大 tile 的 TC 效率未兑现.
+- **F2/F3 未测**: F1 已证净负, F2 (M=128 fragment [128,DV]) 寄存器更紧, F3 需重写时序,
+  趋势单调下降无逆转迹象, 停测.
 
-### warp specialization 4-WG (最大潜力, 实现复杂度最高)
-- 思路: 手写 4 warp 组（producer/S/V/O consumer），element-wise 藏进 GEMM 执行周期
-- 基线 FlashQLA 即此结构（4 warp group + mbarrier + TMA + ping-pong）
-- TileLang 无原语支持外层递推的 warp spec，必须手写 `tx = T.get_thread_binding()` + `if tx < N` 分支 + prologue/main/epilogue + mbarrier parity
-- 参考: `examples/warp_specialize/example_warp_specialize_flashmla.py`
-- 风险: 调试量大，shared 预算已紧
-- 预期: TC 利用率从 13.9% 提升到 40-50%，长序列性能提升 2-3x
+### 三路失败的统一根因 (★ 核心教训)
+1. **tilelang 无 GEMM↔ew 重叠机制**: T.Pipelined 只重叠 load↔compute (pipeline_planning.cc:602 ClassifyCopyLikeStage
+   只认 CopyNode). 单 WG 内 GEMM↔ew 重叠靠 HW OoO, 不可控 (flashmla 重叠的是 GEMM↔TMA load, 不是 GEMM↔ew).
+2. **fragment 复用成本**: WY-O 需 U 驻留 (不覆写), 多一个 [64,DV] shared + fragment 生命周期拉长,
+   threads=256 下寄存器压力激增 → spill 或占用降.
+3. **融合的 copy 开销**: 拼接操作数需 ew 填 shared (block_S×(DK+DV) 次写), 拆结果需 frag→shared→切片读,
+   这些 copy 把省下的 1 GEMM 时间吃光还倒贴. 大 tile 的 TC amortize 收益抵不过 copy.
+4. **async 的 wait(0) 用太狠**: 每 Phase 末 wait(0) 等全部完成, 等于又变同步. 真正藏 ew 需 wait(N) 保留 N 在飞,
+   但 fragment 复用让多 GEMM 在飞会冲突 (同一 fragment 被多 GEMM 写).
 
-### state ping-pong shared
-- 思路: state 不常驻 fragment，用两份 shared ping-pong，降寄存器
-- 风险: shared 预算紧，需复用 buffer
+### ★ 4-WG 已穷尽 (三轮失败, 详见第 6 节 + 第 11 节)
+- R1: 手写 tx + matw → 2.7%
+- R2: FlashMLA 模板 + fence/wait_wgmma → nan
+- R3a: FlashQLA 配置 + WY-O + Q'复用K → chunk0 对 chunk1+ 错
+- R3b: 原始 O 形式 → 死锁 (WY-O 是必须的)
+- R3c: WY-O + Qp 独立 → nan
+- 根因: tilelang 无 4-WG 范本, FlashQLA barrier 极复杂(13 barrier), 跨 chunk state 竞争无法定位
+- **结论: 4-WG 在当前 tilelang + MIG + 远程 5min walltime 下不可行**
 
-### per-case autotune
-- 思路: 用 `@autotune` 对 block_DV/threads/num_stages 搜参
-- 当前固定 block_DV=64，可针对每个 case 形状搜最优
-
-### TMA 替代 async_copy
-- 当前用 `T.copy`（自动降级 TMA/cp.async）
-- 手写 `T.tma_copy` + mbarrier 可能更高效（但需 warp spec 配合）
+### 替代方向 (均预期收益有限, 未验证)
+- **state ping-pong shared**: state 不常驻 fragment, 两份 shared ping-pong 降寄存器. 风险: shared 预算紧
+- **per-case autotune (离线)**: 离线搜参后硬编码 (OJ 禁 autotune). 当前 DV 配置已接近最优, 收益小
+- **TMA 替代 async_copy**: T.tma_copy + mbarrier. 需 warp spec 配合, 4-WG 不可行则受限
+- **实验报告**: 作业页面明确"实验报告是主要评分依据". 三轮 4-WG 踩坑 + WY-O 数学推导 + FlashQLA 源码分析 +
+  WY-O+async+融合三路证伪 (含 tilelang async API 调研) 是报告亮点, 可能比 OJ 93→100 更值
 
 ---
 
