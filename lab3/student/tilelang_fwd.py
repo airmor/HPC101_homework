@@ -1240,6 +1240,318 @@ def _gdn_wyo_fuse_kernel(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_st
 
 
 # ============================================================
+# 4-WG 第五轮: 照搬 FlashQLA hopper fused_fwd.py 的 4-WG 结构
+#
+# ★ 关键发现 (读 FlashQLA 源码 + tilelang builtin.py):
+#   1. T.barrier_arrive/barrier_wait 是 T.mbarrier_arrive/mbarrier_wait_parity 的语法糖 (builtin.py 确认).
+#      FlashQLA 43 处 T.barrier_*, 0 处 T.mbarrier_*, 0 处 fence_proxy_async!
+#   2. FlashQLA 用 T.tma_copy(barrier=data_is_ready[...]) 让 TMA load 完成自动 arrive barrier,
+#      不需手动 fence. element-wise load 的 sub-warp 末尾手动 barrier_arrive.
+#   3. FlashQLA 4 sub-warp producer (tx>=384): 每个载一类 (Q+K / V+β / A+g / O/S store),
+#      data_is_ready arrive_count=96=3 sub-warp×32 (第 4 个 O/S store sub-warp 不参与 data_ready).
+#   4. set_max_nreg: S=160/V=128/O=128/P=32 (之前三轮我漏了这个, 4-WG 寄存器争用是死锁根因之一).
+#   5. FlashQLA 数学: W=V-g⊙U (不是 A@βγK!), U=K@S, Vd=A@W, V'=g_rev⊙Vd.
+#      即 W 和 U 的角色互换 (FlashQLA 的 W 是 gated V, U 是 K@S).
+#   6. 13 个 barrier (data_is_ready/free 双 buffer + bar_0/1/3/4/5 + bar_o).
+#
+# 本轮: 完整照搬 FlashQLA 数学 + barrier 结构 + set_max_nreg + T.tma_copy barrier=,
+#   只适配我们的接口 (g_cumsum 已预算, A 已 solve) 和 per-case DV 分发.
+# ============================================================
+@tilelang.jit(out_idx=[-2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_ws4_fqla_kernel(B, S, Hq, Hv, DK, DV, block_DV=128, threads=512):
+    """4-WG 照搬 FlashQLA hopper. threads=512, 4 sub-warp (S/V/O/P)."""
+    block_S = CHUNK_SIZE
+    num_chunks = (S + block_S - 1) // block_S
+    G = Hv // Hq
+    scale = DK ** -0.5
+
+    QK_shape = (B, S, Hq, DK)
+    V_shape = (B, S, Hv, DV)
+    gate_shape = (B, S, Hv)
+    A_shape = (B, S, Hv, block_S)
+    init_shape = (B, Hv, DK, DV)
+    O_shape = (B, S, Hv, DV)
+    final_shape = (B, Hv, DK, DV)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(QK_shape, dtype=T.bfloat16),
+        K: T.Tensor(QK_shape, dtype=T.bfloat16),
+        V: T.Tensor(V_shape, dtype=T.bfloat16),
+        g_cumsum: T.Tensor(gate_shape, dtype=T.float32),
+        beta: T.Tensor(gate_shape, dtype=T.float32),
+        A: T.Tensor(A_shape, dtype=T.bfloat16),
+        initial_state: T.Tensor(init_shape, dtype=T.float32),
+        O: T.Tensor(O_shape, dtype=T.bfloat16),
+        final_state: T.Tensor(final_shape, dtype=T.float32),
+    ):
+        # grid: (DV/block_DV, B*Hv). FlashQLA 把 batch*H*DV_blocks 拍平成 1 维, 这里保持 2 维.
+        with T.Kernel(T.ceildiv(DV, block_DV), B * Hv, threads=threads) as (bv, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+            bhg = bh // G
+            DV_start = bv * block_DV
+            DV_end = (bv + 1) * block_DV
+
+            # 双 buffer load (num_stages=2 ping-pong, 第一维 stage)
+            q_shared = T.alloc_shared((2, block_S, DK), dtype=T.bfloat16)
+            k_shared = T.alloc_shared((2, block_S, DK), dtype=T.bfloat16)
+            v_shared = T.alloc_shared((2, block_S, block_DV), dtype=T.bfloat16)
+            a_shared = T.alloc_shared((2, block_S, block_S), dtype=T.bfloat16)
+            g_shared = T.alloc_shared((2, block_S), dtype=T.float32, scope="shared")
+            b_shared = T.alloc_shared((2, block_S), dtype=T.float32, scope="shared")
+
+            # consumer 输出 shared (跨 WG 传递)
+            o_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            h_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            vd_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            vn_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            p_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+            g_exp_shared = T.alloc_shared((block_S), dtype=T.float32, scope="shared")
+            g_rev_exp_shared = T.alloc_shared((block_S), dtype=T.float32, scope="shared")
+
+            # fragments
+            h_fragment = T.alloc_fragment((DK, block_DV), dtype=T.float32)
+            o_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            v_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            u_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            p_fragment = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            a_fragment = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            g_fragment = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            g_last_local = T.alloc_local((1), dtype=T.float32)
+
+            # ★ FlashQLA barrier 配置 (照搬)
+            # data_is_ready: 3 producer sub-warp arrive (96=3×32), 3 consumer wait
+            # data_is_free: 3 consumer arrive (384=3×128), producer wait
+            data_is_ready = T.alloc_barrier(arrive_count=[96] * 2)
+            data_is_free = T.alloc_barrier(arrive_count=[384] * 2)
+            bar_o = T.alloc_barrier(arrive_count=128)
+            bar_0 = T.alloc_barrier(arrive_count=416)
+            bar_1 = T.alloc_barrier(arrive_count=256)
+            bar_3 = T.alloc_barrier(arrive_count=128)
+            bar_4 = T.alloc_barrier(arrive_count=128)
+            bar_5 = T.alloc_barrier(arrive_count=416)
+
+            T.use_swizzle(10)
+            tx = T.get_thread_binding()
+
+            PRODUCER_NREG = 32
+            CONSUMER_V_NREG = 128
+            CONSUMER_S_NREG = 160
+            CONSUMER_O_NREG = 128
+
+            # CONSUMER_S [0,128)
+            if tx < 128:
+                T.set_max_nreg(CONSUMER_S_NREG, 1)
+                # init S
+                T.copy(initial_state[bb, bh, 0:DK, DV_start:DV_end], h_fragment)
+                for i_s in T.serial(num_chunks):
+                    T.barrier_wait(data_is_ready[i_s % 2], (i_s // 2 + 0) % 2)
+                    T.barrier_arrive(bar_0)
+                    T.barrier_wait(bar_0, i_s % 2)
+                    # S4[S] S: 发布 h_shared = S_old
+                    T.copy(h_fragment, h_shared)
+                    T.barrier_arrive(bar_1)
+                    T.barrier_wait(bar_1, i_s % 2)
+                    # S *= g_last
+                    g_last_local[0] = g_exp_shared[block_S - 1]
+                    for j_k, j_v in T.Parallel(DK, block_DV):
+                        h_fragment[j_k, j_v] *= g_last_local[0]
+                    T.barrier_arrive(bar_5)
+                    T.barrier_wait(bar_5, i_s % 2)
+                    # S += K^T @ V'
+                    T.gemm(k_shared[i_s % 2, :, :], vn_shared, h_fragment,
+                           transpose_A=True, clear_accum=False)
+                    T.barrier_arrive(data_is_free[i_s % 2])
+                # store final S
+                T.copy(h_fragment, final_state[bb, bh, 0:DK, DV_start:DV_end])
+
+            # CONSUMER_V [128,256)
+            elif tx < 256:
+                T.set_max_nreg(CONSUMER_V_NREG, 1)
+                for i_s in T.serial(num_chunks):
+                    left = i_s * block_S
+                    T.barrier_wait(data_is_ready[i_s % 2], (i_s // 2 + 0) % 2)
+                    T.barrier_arrive(bar_0)
+                    T.barrier_wait(bar_0, i_s % 2)
+                    # g_exp, g_rev_exp
+                    for j_s in T.Parallel(block_S):
+                        g_exp_shared[j_s] = T.exp2(g_shared[i_s % 2, j_s] * LOG2E)
+                    for j_s in T.Parallel(block_S):
+                        g_rev_exp_shared[j_s] = T.exp2(
+                            (g_shared[i_s % 2, block_S - 1] - g_shared[i_s % 2, j_s]) * LOG2E)
+                    T.barrier_arrive(bar_1)
+                    T.barrier_wait(bar_1, i_s % 2)
+                    # U = K @ S
+                    T.gemm(k_shared[i_s % 2, :, :], h_shared, u_fragment, clear_accum=True)
+                    # W = V - g * U  (FlashQLA: W = V - g⊙U, 存回 v_shared 作 W)
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        u_fragment[j_s, j_v] *= -g_exp_shared[j_s]
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        v_shared[i_s % 2, j_s, j_v] = u_fragment[j_s, j_v] + v_shared[i_s % 2, j_s, j_v]
+                    T.barrier_wait(bar_3, i_s % 2)
+                    # Vd = A @ W
+                    T.gemm(a_shared[i_s % 2, :, :], v_shared[i_s % 2, :, :], v_fragment, clear_accum=True)
+                    T.copy(v_fragment, vd_shared)
+                    T.barrier_arrive(bar_4)
+                    # V' = g_rev * Vd
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        v_fragment[j_s, j_v] *= g_rev_exp_shared[j_s]
+                    T.copy(v_fragment, vn_shared)
+                    T.barrier_arrive(bar_5)
+                    T.barrier_wait(bar_5, i_s % 2)
+                    T.barrier_arrive(data_is_free[i_s % 2])
+
+            # CONSUMER_O [256,384)
+            elif tx < 384:
+                T.set_max_nreg(CONSUMER_O_NREG, 1)
+                for i_s in T.serial(num_chunks):
+                    left = i_s * block_S
+                    T.barrier_wait(data_is_ready[i_s % 2], (i_s // 2 + 0) % 2)
+                    T.barrier_arrive(bar_0)
+                    T.barrier_wait(bar_0, i_s % 2)
+                    # P = Q K^T
+                    T.gemm(q_shared[i_s % 2, :, :], k_shared[i_s % 2, :, :], p_fragment,
+                           transpose_B=True, clear_accum=True)
+                    # G = Lower(exp(g_i - g_j))
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        g_fragment[j_s, j_t] = g_shared[i_s % 2, j_s] - g_shared[i_s % 2, j_t]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        if j_s >= j_t:
+                            g_fragment[j_s, j_t] = T.exp2(g_fragment[j_s, j_t] * LOG2E)
+                        else:
+                            g_fragment[j_s, j_t] = 0
+                    # Ag = G * A * b  (A 已是 kkt solve 的 A, b=beta)
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_fragment[j_s, j_t] = a_shared[i_s % 2, j_s, j_t]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_fragment[j_s, j_t] *= g_fragment[j_s, j_t]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_fragment[j_s, j_t] *= b_shared[i_s % 2, j_t]
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        a_shared[i_s % 2, j_s, j_t] = a_fragment[j_s, j_t]
+                    T.barrier_wait(bar_1, i_s % 2)
+                    # O = Q @ S
+                    T.gemm(q_shared[i_s % 2, :, :], h_shared, o_fragment, clear_accum=True)
+                    # Pg = scale * G * P
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        p_fragment[j_s, j_t] *= scale * g_fragment[j_s, j_t]
+                    T.copy(p_fragment, p_shared)
+                    T.barrier_arrive(bar_3)
+                    # O = scale * g * O
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        o_fragment[j_s, j_v] *= scale * g_exp_shared[j_s]
+                    T.barrier_wait(bar_4, i_s % 2)
+                    # O += Pg @ Vd
+                    T.gemm(p_shared, vd_shared, o_fragment, clear_accum=False)
+                    T.barrier_arrive(bar_5)
+                    T.barrier_wait(bar_5, i_s % 2)
+                    T.copy(o_fragment, o_shared)
+                    T.barrier_arrive(data_is_free[i_s % 2])
+                T.barrier_arrive(bar_o)
+
+            # PRODUCER [384,512): 4 sub-warp 载不同数据
+            else:
+                T.set_max_nreg(PRODUCER_NREG, 0)
+                # sub-warp 0 [384,416): Q, K
+                if tx < 384 + 32:
+                    for i_s in T.serial(num_chunks):
+                        T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
+                        left = i_s * block_S
+                        right = left + block_S
+                        # TMA load Q (barrier= 自动 arrive)
+                        if right <= S:
+                            T.tma_copy(Q[bb, left:right, bhg, 0:DK], q_shared[i_s % 2, :, :],
+                                       barrier=data_is_ready[i_s % 2])
+                            T.tma_copy(K[bb, left:right, bhg, 0:DK], k_shared[i_s % 2, :, :],
+                                       barrier=data_is_ready[i_s % 2])
+                        else:
+                            for j_s, j_k in T.Parallel(block_S, DK):
+                                if left + j_s < S:
+                                    q_shared[i_s % 2, j_s, j_k] = Q[bb, left + j_s, bhg, j_k]
+                                    k_shared[i_s % 2, j_s, j_k] = K[bb, left + j_s, bhg, j_k]
+                                else:
+                                    q_shared[i_s % 2, j_s, j_k] = 0
+                                    k_shared[i_s % 2, j_s, j_k] = 0
+                            T.barrier_arrive(data_is_ready[i_s % 2])
+                            T.barrier_arrive(data_is_ready[i_s % 2])
+                # sub-warp 1 [416,448): V, beta
+                elif tx < 384 + 64:
+                    for i_s in T.serial(num_chunks):
+                        T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
+                        left = i_s * block_S
+                        right = left + block_S
+                        if right <= S:
+                            T.tma_copy(V[bb, left:right, bh, DV_start:DV_end],
+                                       v_shared[i_s % 2, :, :], barrier=data_is_ready[i_s % 2])
+                        else:
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                if left + j_s < S:
+                                    v_shared[i_s % 2, j_s, j_v] = V[bb, left + j_s, bh, DV_start + j_v]
+                                else:
+                                    v_shared[i_s % 2, j_s, j_v] = 0
+                            T.barrier_arrive(data_is_ready[i_s % 2])
+                        # beta (element-wise, 手动 arrive)
+                        if right <= S:
+                            for j_s in T.Parallel(block_S):
+                                b_shared[i_s % 2, j_s] = beta[bb, left + j_s, bh]
+                        else:
+                            for j_s in T.Parallel(block_S):
+                                if left + j_s < S:
+                                    b_shared[i_s % 2, j_s] = beta[bb, left + j_s, bh]
+                                else:
+                                    b_shared[i_s % 2, j_s] = 0
+                        T.barrier_arrive(data_is_ready[i_s % 2])
+                # sub-warp 2 [448,480): A, g
+                elif tx < 384 + 96:
+                    for i_s in T.serial(num_chunks):
+                        T.barrier_wait(data_is_free[i_s % 2], (i_s // 2 + 1) % 2)
+                        left = i_s * block_S
+                        right = left + block_S
+                        if right <= S:
+                            T.tma_copy(A[bb, left:right, bh, 0:block_S],
+                                       a_shared[i_s % 2, :, :], barrier=data_is_ready[i_s % 2])
+                        else:
+                            for j_s, j_t in T.Parallel(block_S, block_S):
+                                if left + j_s < S:
+                                    a_shared[i_s % 2, j_s, j_t] = A[bb, left + j_s, bh, j_t]
+                                else:
+                                    a_shared[i_s % 2, j_s, j_t] = 1 if j_s == j_t else 0
+                            T.barrier_arrive(data_is_ready[i_s % 2])
+                        # g (element-wise)
+                        if right <= S:
+                            for j_s in T.Parallel(block_S):
+                                g_shared[i_s % 2, j_s] = g_cumsum[bb, left + j_s, bh]
+                        else:
+                            for j_s in T.Parallel(block_S):
+                                if left + j_s < S:
+                                    g_shared[i_s % 2, j_s] = g_cumsum[bb, left + j_s, bh]
+                                else:
+                                    g_shared[i_s % 2, j_s] = g_cumsum[bb, S - 1, bh]
+                        T.barrier_arrive(data_is_ready[i_s % 2])
+                # sub-warp 3 [480,512): O store (照搬 FlashQLA store sub-warp 结构)
+                # ★ FlashQLA store sub-warp: 循环 arrive(bar_0)→wait(bar_0)→store O→arrive(bar_5)→wait(bar_1)
+                #   只跑 num_unmasked_iters (无尾块 case = num_chunks), 最后单存最后一个 O.
+                else:
+                    for i_s in T.serial(num_chunks):
+                        right = i_s * block_S
+                        left = right - block_S
+                        T.barrier_arrive(bar_0)
+                        T.barrier_wait(bar_0, i_s % 2)
+                        # store O (上一 chunk 的)
+                        if i_s > 0:
+                            T.copy(o_shared, O[bb, left:right, bh, DV_start:DV_end])
+                        T.barrier_arrive(bar_5)
+                        T.barrier_wait(bar_1, i_s % 2)
+                    # 最后一个 chunk 的 O
+                    last_left = (num_chunks - 1) * block_S
+                    last_right = last_left + block_S
+                    T.barrier_wait(bar_o, 0)
+                    T.copy(o_shared, O[bb, last_left:last_right, bh, DV_start:DV_end])
+
+    return kernel
+
+
+# ============================================================
 # Phase A: 2-WG producer/consumer 探针 kernel (验证 warp-spec API)
 #   最小可复现样例: 照抄官方 example_warp_specialize_gemm_barrierpipe_stage2 的 barrier 模式
 #   producer (T.ws(1)): TMA load → arrive; consumer (T.ws(0)): wait → 用 T.copy 写回 global
@@ -1462,6 +1774,7 @@ def gdn_prefill_forward(
     #   GDN_WYO=1     跑 WY-O+async 实验版 (长序列实验, 默认关, 默认走 matw 保 93 基线)
     #   GDN_TMA=1      跑 TMA load 版 (T.copy producer + num_stages=2, 仅 T%64==0 长序列)
     #   GDN_DECOMP=1   跑三 kernel 分解 (K1 并行 W/U/ds + K2 串行 S + K3 并行 O)
+    #   GDN_WS4_FQLA=1 跑 4-WG 照搬 FlashQLA hopper (第五轮)
     import os
     _WS_PROBE = os.environ.get("GDN_WS_PROBE", "0") == "1"
     _WYO = os.environ.get("GDN_WYO", "0") == "1"
@@ -1469,7 +1782,21 @@ def gdn_prefill_forward(
     _WYO_FUSE = os.environ.get("GDN_FUSE_ALL", "0") == "1"
     _TMA = os.environ.get("GDN_TMA", "0") == "1"
     _DECOMP = os.environ.get("GDN_DECOMP", "0") == "1"
-    if _WS_PROBE:
+    _WS4_FQLA = os.environ.get("GDN_WS4_FQLA", "0") == "1"
+    if _WS4_FQLA and (num_tokens % CHUNK_SIZE == 0):
+        # ★ 4-WG 照搬 FlashQLA hopper (第五轮): 4 sub-warp producer + set_max_nreg +
+        #   T.tma_copy(barrier=) 自动 arrive + 13 barrier 结构. 数学 = FlashQLA (W=V-g⊙U).
+        #   子agent确认: T.barrier_* 是 T.mbarrier_* 语法糖 (同 TIR), 但 FlashQLA 0 处
+        #   fence_proxy_async — 因 T.tma_copy barrier= 让 TMA 完成自动 arrive+可见.
+        #   尾块 case (short_tail) 不走此路.
+        _grid = batch_size * num_heads_v
+        _bdv = 128 if _grid > 4 else 64
+        kernel = _gdn_ws4_fqla_kernel(
+            batch_size, num_tokens, num_heads_qk, num_heads_v,
+            head_dim_k, head_dim_v,
+            block_DV=_bdv, threads=512,
+        )
+    elif _WS_PROBE:
         # 探针: 所有长度都走 ws 探针 (方便用 short_tail 调试)
         # threads=256 才有 2 个 warp group: ws(0)=[0,128) producer, ws(1)=[128,256) consumer
         kernel = _gdn_ws_probe_kernel(

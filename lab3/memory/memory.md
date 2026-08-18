@@ -568,7 +568,7 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - ★ 数学验证脚本 (/tmp/test_scan_math.py): 证实 M[c]/b[c] scan + 三 kernel 分解数学零误差,
   为实验报告提供"精确分解数学正确但 MIG 工程不可行"的完整论证.
 
-## 11. 优化方向穷尽总结 (截至 2026-08-18)
+## 11. 优化方向穷尽总结 (截至 2026-08-19)
 
 ### 已验证不可行
 | 方向 | 结果 | 根因 |
@@ -596,6 +596,7 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | **TMA load (T.copy 替代 T.Parallel, 单 WG, ns=1)** | **全 PASS, 长序列慢 ~20-27%** | 见下表; TMA bulk load 未兑现 load↔compute 重叠 |
 | **TMA load ns=2 (显式 ping-pong _2 buffer)** | shared 超 232KB (273KB) | T.Pipelined 已自动 multi-version, 显式 _2 双重计算爆 shared |
 | **三 kernel 分解 (K1 并行 W/U/ds + K2 串行 S + K3 并行 O)** | **全 PASS 但慢 1.1-1.9x** (chain 1.211, long_low 6.584, wide 12.077) | K2 串行无 T.Pipelined 重叠; W/U/S global 物化往返; DV 整块寄存器压力; 占用率收益被 per-block 工作量轻吃光 |
+| **4-WG 第五轮 照搬 FlashQLA hopper** | 死锁 (kernel 挂起, 5min walltime timeout) | 13 barrier handshake 极复杂; 多 WG arrive_count (96/384/416/256/128) 时序对不齐; 子agent确认 T.barrier 是 T.mbarrier 糖不自动 fence, 但 FlashQLA 靠 T.tma_copy(barrier=) 自动 arrive 避免显式 fence, 我的照搬仍有时序错配 |
 
 ### 4-WG 三轮失败的根本原因 (最终结论)
 1. **tilelang 无 4-WG 官方范本**: FlashQLA hopper 是唯一 4-WG (手写 tx), 但其 barrier 极复杂 (13 barrier + 4 producer sub-warp), 远超手写调通能力
