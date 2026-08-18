@@ -500,7 +500,38 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - 说明误差不是 wgmma vs mma 问题, 是多 WG 同步可见性
 - matw+T.serial 单 kernel PASS 证明: T.serial 本身不引入误差
 
-## 11. 优化方向穷尽总结 (截至 2026-08-17)
+### TMA load 实验 (单 WG, T.copy 替代 T.Parallel, **精度全过性能仍退**)
+- ★ 动机: 子agent2 调研 T.Pipelined 的 ClassifyCopyLikeStage (pipeline_planning.cc:602) 只认
+  T.copy(global→shared) 为 producer, T.Parallel ew load 进 consumer 和 GEMM 串行. 把 6 个 load 换 T.copy
+  期望 load↔compute 重叠. 子agent3 确认 state 用单 shared (chunk_delta_h.py 标准模式, 不需 ping-pong).
+- ★ 实测 (GDN_TMA=1, ns=1, 同 matw 数学):
+  | case | matw (93基线) | TMA ns=1 | 变化 |
+  |------|------|------|------|
+  | chain_equal (DV=64,th=128,ns=2) | 0.539 | 0.594 | +10% |
+  | long_low_gva (DV=128,th=256,ns=1) | 3.16 | 4.008 | +27% |
+  | wide_gva_state (DV=128) | 4.14 | 5.113 | +23% |
+  | deep_gva_state (DV=128) | 4.85 | 6.077 | +25% |
+  | batch_split_gva (DV=128) | 2.40 | 3.013 | +25% |
+  | parallel_equal (DV=64) | 0.45 | 0.469 | +4% |
+  | parallel_gva (DV=64) | 0.43 | 0.476 | +11% |
+- ★ 编译警告暴露根因:
+  - "src range must have last dim multiple of 16 for tma bulk load g_cumsum range 1*4 % 16 != 0"
+    g/beta 是 [block_S] 1D FP32, TMA bulk load 要求末维 16 倍数, block_S=64 FP32=256B 满足但 range shape "1*4"
+    (B*Hq?) 不满足 → **g/beta 的 T.copy fallback 到 normal copy (element-wise)**, 没走 TMA!
+  - "src and dst must have the same dtype for tma load initial_state vs s_shared dtype float32 vs bfloat16
+    will be fallback to normal copy" → initial_state T.copy 也 fallback.
+  - 即只有 Q/K/V/A 的 T.copy 真走 TMA, g/beta/initial_state 仍 element-wise.
+- ★ ns=2 (显式 _2 ping-pong buffer): shared 273KB > 232KB 超限. 因 T.Pipelined 已对 T.copy producer
+  自动 multi-version (MultiVersionBufferRewriter), 显式 _2 维 + 自动 multi-version 双重计算爆 shared.
+  正确做法是单 buffer + ns=2 让 T.Pipelined 自动管 (但 DV=128 th=256 寄存器紧, ns=2 可能仍超).
+- **结论**: TMA bulk load 在 GDN 上未兑现 load↔compute 重叠. 原因推测:
+  (1) g/beta fallback 到 element-wise, 这两个 ew 仍在 consumer 串行
+  (2) T.Pipelined 的自动 multi-version 对 6 个 producer T.copy 生成复杂 pipeline, 可能与 consumer 的
+      state 递推依赖 (s_fragment 跨 chunk) 冲突, 实际重叠有限
+  (3) H800 MIG 14 SM, load 本身不是瓶颈 (L2 cache 命中率高), GEMM/ew 才是
+- **回退**: GDN_TMA 默认关, 走 matw 保 93 分基线. 代码保留 _gdn_tma_kernel 供报告引用.
+
+## 11. 优化方向穷尽总结 (截至 2026-08-18)
 
 ### 已验证不可行
 | 方向 | 结果 | 根因 |
@@ -525,6 +556,8 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | **WY-O 同步对照 (单 WG)** | **慢 2.3x** (chain 1.230, long_low 4.604) | 无 async 收益, 纯 +1 GEMM 串行, 证明 async 给了微小但不够的收益 |
 | **WY-O + GEMM 融合 F1 (A@[βγK\|βV]→[W\|U], N=256)** | **慢 2.6x** (chain 1.363, long_low 5.468) | 拼接 ew + frag→shared 中转 copy 开销 > 省 1 GEMM; N=256 大 tile 占用未兑现 |
 | WY-O + F2/F3 融合 | 未测 (F1 已证净负) | F2 fragment [128,DV] 寄存器更紧; F3 需重写时序; 趋势单调下降无逆转迹象 |
+| **TMA load (T.copy 替代 T.Parallel, 单 WG, ns=1)** | **全 PASS, 长序列慢 ~20-27%** | 见下表; TMA bulk load 未兑现 load↔compute 重叠 |
+| **TMA load ns=2 (显式 ping-pong _2 buffer)** | shared 超 232KB (273KB) | T.Pipelined 已自动 multi-version, 显式 _2 双重计算爆 shared |
 
 ### 4-WG 三轮失败的根本原因 (最终结论)
 1. **tilelang 无 4-WG 官方范本**: FlashQLA hopper 是唯一 4-WG (手写 tx), 但其 barrier 极复杂 (13 barrier + 4 producer sub-warp), 远超手写调通能力
