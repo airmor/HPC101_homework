@@ -129,12 +129,47 @@ user time 2676s : sys time 3043s       # sys > user ← 通信/sys 开销大
 3. **IPC 1.28**：远未到计算瓶颈（健康 >2），向量化/OpenMP 还有空间。
 4. branch-miss 和 L1 miss 正常，不是分支/局部性微观问题。
 
-#### perf record（进行中）
-- 容器内核 `perf_event_mlock_kb=516` 且只读，`--call-graph dwarf` 需大 mmap
-  → "Permission error mapping pages"。已改用 `-e cycles:u -m 1 --call-graph fp`
-  （最小 mmap + frame pointer 调用栈），重跑中。
-- 目标：拿到 ABE 内部 top-10 热点函数表（文件 + 计算类型），确认上述
-  瓶颈判断指向哪些具体 kernel（候选：bssn_rhs / fderivs / prolongrestrict）。
+#### perf record 热点函数表（t=3，582K samples，`-e cycles:u -m1 --call-graph fp`）
+
+| 占比 | 函数 | 来源 | 类型 |
+|------|------|------|------|
+| **25.57%** | `0xf13c4` opal | libopen-pal.so (OpenMPI) | **MPI 进度/通信** |
+| **21.36%** | `compute_rhs_bssn_` | bssn_rhs.f90 | BSSN 右端项计算 |
+| **17.07%** | `[k] 0xffff...` | 内核态 | sys/kernel（通信/syscall） |
+| 3.30% | `fdderivs_` | diff_new.f90 | 二阶差分 |
+| 3.27% | `__memcpy_sve` | libc | 内存拷贝 |
+| 2.82% | `lopsided_` | lopsidediff.f90 | 单侧差分 |
+| 2.66% | `polint_` | ABE | 插值（prolong） |
+| 2.39% | `__memset_sve_zva64` | libc | 内存清零 |
+| 2.11% | `kodis_` | kodiss.f90 | Kreiss-Oliger 耗散 |
+| 1.70% | `fderivs_` | diff_new.f90 | 一阶差分 |
+| 1.32% | `prolong3_` | prolongrestrict | AMR 延拓 |
+| ~1.10% | `cfree`/`malloc` | libc | 动态内存分配/释放 |
+| 0.66% | `rungekutta4_rout_` | rungekutta4_rout.f90 | RK4 时间推进 |
+
+**瓶颈结论（perf record 实锤，修正 perf stat 初判）**：
+1. **MPI 通信是第一大头（~45%+）**：`libopen-pal` opal_progress 系列 25.6% +
+   kernel 态 17% + 多个 opal 小项。rank 间大量时间在 MPI barrier 等待 / 消息
+   进度轮询。与 perf stat 的 sys>user 完全吻合。
+   → **Phase 4 通信优化不是条件触发，而是第一优先级之一**。
+2. **`compute_rhs_bssn_` 21.36%** 是计算热点第一（bssn_rhs.f90），内部大量
+   整体数组语法 + fderivs/fdderivs 调用。
+3. **差分类合计 ~8.2%**（fdderivs+lopsided+fderivs+kodis）：stencil 计算，
+   OpenMP + 向量化天然落点。
+4. **内存操作 ~6.8%**（memcpy+memset+malloc/cfree）：临时数组分配/拷贝/清零，
+   对应整体数组语法产生的中间临时数组。消除临时数组能吃下这部分。
+5. **AMR prolong/restrict ~4%**：不是大头。
+
+#### 策略调整（基于热点表）
+原 Phase 顺序（编译→OpenMP→kernel→通信）改为：
+- Phase 1 编译/工具链
+- Phase 2 OpenMP + MPI 平衡（降 rank 数 → 直接减通信量，OpenMP 填补单 rank 算力）
+- Phase 3 通信优化（提前，针对 opal_progress / barrier / ghost exchange）
+- Phase 4 Fortran kernel（compute_rhs + 差分 + 消除临时数组）
+- Phase 5 收尾固化
+
+**理由**：通信 45%+ 是第一瓶颈，但通信优化的前提是先用 OpenMP 降 rank 数
+（纯 MPI 30 rank 通信开销 inherent 高）。OpenMP 同时给 kernel 向量化铺路。
 
 #### perf profile 操作要点（记入 spec 供复现）
 - 计时/profile 用 `--twop-cache`，先手工 seed `twopuncture_cache/<sha1>/`
