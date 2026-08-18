@@ -52,8 +52,9 @@
 
 - **DevPod**: `ssh h3250105245+lab4-1+hpc101@clusters.zju.edu.cn -p 443`
   （arm64-920B 预设）
-- **计算节点**: `hpc submit -p lab4 -c N -- bash ./job_run.sh`
-  - lab4 分区：1–60 核，100GB，walltime 30min，镜像 `hpc101-lab4:4`
+- **计算节点**: `hpc submit -p lab4 -c N -t <walltime> -- bash ./job_run.sh`
+  - lab4 分区：1–60 核，100GB，**walltime 硬上限 30min（1800s）**，
+    镜像 `hpc101-lab4:4`
   - **关键坑 1**：计算节点默认 cwd 不是 devpod 的提交 cwd（容器初始 cwd
     指向 `/workspace/lab4` 而非 NFS 家目录），导致 `run.sh` 的
     `ROOT_DIR=$(pwd)` 解析错误、找不到 `build/ABE`。`job_run.sh`
@@ -63,6 +64,28 @@
     `64-93` 这 30 核），`mpiexec -n 30 ./ABE` 报 "not enough slots"。
     `job_run.sh` 用 `AMSS_MPIEXEC="mpiexec --allow-run-as-root --oversubscribe"`
     绕过。后续改 MPICH 时此坑不同（MPICH 无 PRRTE slot 概念）。
+
+### Baseline 实测（关键，决定策略）
+
+- 每个物理 timestep（Δt=1.0）≈ **60.3 秒**（30 rank、`-O3 -g`、纯 MPI，
+  无 OpenMP）。从 `ABE_out.log` 的 `Timestep #N: ... Computer used X seconds`
+  实测，t=9..15 稳定在 60s/步。
+- TwoPuncture + setup ≈ 20s。
+- **baseline 端到端（外推 t=40）≈ 2432s** = 60.3 × 40 + 20。
+- **完整 baseline 跑不完**：walltime 硬上限 1800s < baseline ~2432s，
+  实测 t=15 时被 Timeout 杀死。不是排队问题，是硬上限。
+- 评分对照：340s=100 分（需 ~7.2× 加速），500s=60 分（需 ~4.9× 加速），
+  baseline ~2432s。优化空间巨大。
+
+### 计时与验证协议（因 walltime 限制）
+
+- **性能基准**：用每步秒数 × 40 + TwoPuncture 外推 t=40 总时间。每步秒数
+  从 `ABE_out.log` 的 `Computer used X seconds` 取（稳定值）。
+- **优化迭代**：用 **t=5 短跑**（~5 分钟，安全在 walltime 内）测每步秒数，
+  外推比较。文档："大多数优化手段在不同演化时间的 Scaling 效果非常好"。
+- **正确性验证**：`./check.sh` 支持不同步数比对（对 `golden/`），用短时长
+  验证。调试可临时缩短 `Final_Evolution_Time`，但正式评分必须恢复 40.0。
+- **最终确认**：最优配置若总时间 < 30min，跑一次完整 t=40 确认。
 - **CPU**: TaiShan-v120（鲲鹏 920B），aarch64，256 核，4 NUMA node
   （每 node 64 核）。任务限 30 核。
 - **默认工具链**: GNU 14 + OpenMPI 5（`gfortran`/`mpicxx`/`mpifort`/`perf`）
@@ -77,17 +100,15 @@
 ## Phase 0: Baseline + Profile
 
 ### 目标
-拿到真 baseline 时间 + 热点 profile，作为所有后续优化的依据和报告素材。
+拿到 baseline 时间 + 热点 profile，作为所有后续优化的依据和报告素材。
 
-### 步骤
-1. 恢复 `Final_Evolution_Time=40.0`（smoke test 改过 1.0，必须改回）
-2. 正式 baseline 计时（计算节点，非 devpod）：
-   - `hpc submit -p lab4 -c 30 -- bash ./job_run.sh`
-   - 默认 `MPI_processes=30, OMP_threads=1, GPU=no`（纯 MPI baseline）
-   - 记录 `This Program Cost = X Seconds`
-   - 另用 `--twop-cache` 跑一次，分离 TwoPuncture 时间 vs ABE 演化时间
-3. 正确性验证：`./check.sh` 对 `golden/`，确认 baseline 本身通过
-4. perf profile（计算节点）：
+### Baseline（已完成）
+- 每步 ~60.3s，外推 t=40 ≈ 2432s（详见"环境事实"）。
+- 完整 baseline 受 walltime 30min 限制跑不完，用外推值作基准。
+
+### Profile（进行中）
+1. 恢复 `Final_Evolution_Time` 为短值（t=2~3）用于 profile（已改 t=3）
+2. perf profile（计算节点）：
    - 编译加 `-g`（已做：`AMSS_OPT="-O3 -g"`）让热点对应源文件/行号
    - `perf stat -d ./run.sh` — 完整 IPC/cache miss/分支/TLB
    - `perf record --call-graph dwarf -- ./run.sh` — 采样热点+调用栈
