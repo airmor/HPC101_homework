@@ -531,6 +531,43 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
   (3) H800 MIG 14 SM, load 本身不是瓶颈 (L2 cache 命中率高), GEMM/ew 才是
 - **回退**: GDN_TMA 默认关, 走 matw 保 93 分基线. 代码保留 _gdn_tma_kernel 供报告引用.
 
+### 三 kernel 分解 (K1 并行 W/U/ds + K2 串行 S + K3 并行 O, **精度全过性能全退**)
+- ★ 数学验证 (torch FP64): state ref vs serial-scan diff 2.78e-16, O decomp vs O_ref 0.00e+00.
+  M[c]=γr·I−sKᵀ@W, b[c]=sKᵀ@U, S[c]=M[c]@S[c-1]+b[c]. W/U/ds 三 GEMM state-free.
+  7 GEMM 里只有 W@S→V_new→Kᵀ@V_new→S_new (2 GEMM) 真串行.
+- ★ 动机: 单 kernel grid=B×Hv (chain=4, long_low=8) 严重欠占 14 SM. 拆成 K1/K3 grid=chunks×B×Hv
+  (long_low 512×8=4096 blocks) 填满 SM. state 精确串行 (无 scan 近似, 误差不叠加).
+- ★ 实测 (GDN_DECOMP=1, DV 整块不切, threads 自适应):
+  | case | matw (93基线) | decomp | 变化 |
+  |------|------|------|------|
+  | chain_equal (th=128) | 0.539 | 1.211 | +125% |
+  | long_low_gva (th=256) | 3.16 | 6.584 | +108% |
+  | wide_gva_state (th=256) | 4.14 | 12.077 | +192% |
+  | deep_gva_state (th=256) | 4.85 | 12.495 | +158% |
+  | batch_split_gva (th=256) | 2.40 | 6.162 | +157% |
+  | parallel_equal (th=256) | 0.45 | 0.999 | +122% |
+  | parallel_gva (th=256) | 0.43 | 0.915 | +113% |
+- ★ 退步根因 (统一):
+  (1) **K2 串行 kernel 瓶颈**: K2 grid=B×Hv (long_low=8), chunk 串行 T.serial.
+      单 kernel 里 chunk 串行但有 T.Pipelined 重叠 load; K2 用 T.serial 无重叠, 每 chunk
+      6 次 global→shared T.copy (K/W/U/g + S存/读) 全串行. long_low 512 chunk × 6 copy 累积.
+  (2) **global 读写开销**: K2 读 W/U/K/g (40KB/chunk), 写 S_all (64KB/chunk); K3 读 S_all+W/U/ds.
+      long_low 共 ~50MB 额外 global 读写, 无 L2 命中 (S_all 首次写, K3 首次读).
+  (3) **DV 整块不切**: s_shared [128,128] BF16 = 32KB, s_fragment [128,128] FP32 = 64KB.
+      K2 threads=256 下 s_fragment 64KB 寄存器 → spill. 无法像 matw 那样 DV=64 降一半.
+  (4) **3 kernel launch + JIT**: 3 个 kernel 各编译一次, OJ walltime 紧张.
+  (5) **占用率提升没兑现**: K1/K3 grid 虽大, 但每 block 只 3/2 GEMM (比 matw 7 少),
+      per-block 工作量太轻, launch 开销 + global 往返吃掉占用率收益.
+- ★ 与 matw 的根本差异: matw 单 kernel 把 W/U 复用 (tmp_dv 临时, 算完即丢), state 驻 fragment.
+  decomp 把 W/U 物化到 global (K1→K2→K3 传递), 每 chunk 多 3 次 [64,128] 写 + 3 次读.
+  物化开销 >> 占用率收益. 这是 "拆 kernel" 的固有代价.
+- **结论**: 三 kernel 分解在 MIG 上性能全退 (1.1-1.9x 慢). 数学正确但工程不可行:
+  K2 串行 kernel 无 T.Pipelined 重叠 + global 物化 W/U/S 开销 + DV 整块寄存器压力.
+  占用率提升 (chain 4→512 blocks) 被 per-block 工作量太轻 + global 往返吃光.
+- **回退**: GDN_DECOMP 默认关, 走 matw 保 93 分基线. 代码保留 K1/K2/K3 供报告引用.
+- ★ 数学验证脚本 (/tmp/test_scan_math.py): 证实 M[c]/b[c] scan + 三 kernel 分解数学零误差,
+  为实验报告提供"精确分解数学正确但 MIG 工程不可行"的完整论证.
+
 ## 11. 优化方向穷尽总结 (截至 2026-08-18)
 
 ### 已验证不可行
@@ -558,6 +595,7 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | WY-O + F2/F3 融合 | 未测 (F1 已证净负) | F2 fragment [128,DV] 寄存器更紧; F3 需重写时序; 趋势单调下降无逆转迹象 |
 | **TMA load (T.copy 替代 T.Parallel, 单 WG, ns=1)** | **全 PASS, 长序列慢 ~20-27%** | 见下表; TMA bulk load 未兑现 load↔compute 重叠 |
 | **TMA load ns=2 (显式 ping-pong _2 buffer)** | shared 超 232KB (273KB) | T.Pipelined 已自动 multi-version, 显式 _2 双重计算爆 shared |
+| **三 kernel 分解 (K1 并行 W/U/ds + K2 串行 S + K3 并行 O)** | **全 PASS 但慢 1.1-1.9x** (chain 1.211, long_low 6.584, wide 12.077) | K2 串行无 T.Pipelined 重叠; W/U/S global 物化往返; DV 整块寄存器压力; 占用率收益被 per-block 工作量轻吃光 |
 
 ### 4-WG 三轮失败的根本原因 (最终结论)
 1. **tilelang 无 4-WG 官方范本**: FlashQLA hopper 是唯一 4-WG (手写 tx), 但其 barrier 极复杂 (13 barrier + 4 producer sub-warp), 远超手写调通能力
