@@ -107,14 +107,41 @@
 - 完整 baseline 受 walltime 30min 限制跑不完，用外推值作基准。
 
 ### Profile（进行中）
-1. 恢复 `Final_Evolution_Time` 为短值（t=2~3）用于 profile（已改 t=3）
-2. perf profile（计算节点）：
-   - 编译加 `-g`（已做：`AMSS_OPT="-O3 -g"`）让热点对应源文件/行号
-   - `perf stat -d ./run.sh` — 完整 IPC/cache miss/分支/TLB
-   - `perf record --call-graph dwarf -- ./run.sh` — 采样热点+调用栈
-   - `perf report` 找 top 函数
-   - 确认报告采样到 `ABE`（run.sh 会启动 Python→TwoPuncture→mpirun 子进程；
-     必要时直接对 `mpirun -n 30 ./ABE` 采样）
+
+#### perf stat 结果（t=3 实跑 191.3s，cache 命中跳过 TwoPuncture）
+```
+task-clock:u        5,718,158 msec    # 28.294 CPUs utilized
+instructions:u      9,103,483,180,716 # IPC 1.28  insn/cycle  ← 偏低
+cycles:u            7,092,576,951,655  # 1.240 GHz
+branches:u          1,228,402,171,500  # branch-miss 1.33% (正常)
+L1-dcache-loads:u    3,630,268,114,257 # L1-dcache-miss 2.58% (正常)
+LLC-loads:u             53,472,158,238 # LLC-load-miss 52.59% ← 严重
+user time 2676s : sys time 3043s       # sys > user ← 通信/sys 开销大
+```
+
+**瓶颈判断（初步，待 perf record 热点函数确认）**：
+1. **访存瓶颈为主**：LLC miss 52.6% 过半未命中 → 数据搬运重，不是纯计算。
+   → Phase 3 访存优化（数据布局、cache 友好、消除临时数组）是关键收益点。
+2. **sys 时间 > user 时间**：30 rank MPI 通信 + kernel 过渡（fork/调度）开销大。
+   → 印证 MPI 通信占比可能高，Phase 4 通信优化大概率需要做（非条件触发，
+   而是实锤了 sys 占比高）。但也可能是 OpenMP 缺失导致单 rank 串行 +
+   MPI barrier 等待放大了 sys。
+3. **IPC 1.28**：远未到计算瓶颈（健康 >2），向量化/OpenMP 还有空间。
+4. branch-miss 和 L1 miss 正常，不是分支/局部性微观问题。
+
+#### perf record（进行中）
+- 容器内核 `perf_event_mlock_kb=516` 且只读，`--call-graph dwarf` 需大 mmap
+  → "Permission error mapping pages"。已改用 `-e cycles:u -m 1 --call-graph fp`
+  （最小 mmap + frame pointer 调用栈），重跑中。
+- 目标：拿到 ABE 内部 top-10 热点函数表（文件 + 计算类型），确认上述
+  瓶颈判断指向哪些具体 kernel（候选：bssn_rhs / fderivs / prolongrestrict）。
+
+#### perf profile 操作要点（记入 spec 供复现）
+- 计时/profile 用 `--twop-cache`，先手工 seed `twopuncture_cache/<sha1>/`
+  （用上一次 run 的 `Ansorg.psid` + `TwoPunctureinput.par` 的 sha1）。
+- perf 在容器内 mmap 受限，必须 `-m 1`（或 `-m 8`），且 `--call-graph fp`
+  替代 `dwarf`。`-e cycles:u` 或 `task-clock:u` 采样用户态热点。
+- perf stat 不受 mmap 限制，已成功拿到硬件计数器。
 
 ### 产出（报告核心素材）
 - 端到端时间分解表（TwoPuncture / ABE 演化 / setup+plot）
