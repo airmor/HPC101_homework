@@ -245,16 +245,29 @@ else:
   short_tail=0.346, chain=0.498, parallel_equal=0.511, parallel_gva=0.492,
   long_low=1.859, batch_split=1.532, wide=2.427, deep=2.831
 
+★ num_stages=2 微优化 (2026-08-19): 大 grid 长序列 matw 从 st=1 改 st=2,
+  T.Pipelined 自动 multi-version shared buffer, 跨 chunk load 重叠:
+  | case | st=1 (旧) | st=2 (新) | t100 | p (新) |
+  |------|------|------|------|------|
+  | long_low | 3.16 | 3.04 | 1.859 | 0.61 |
+  | wide | 4.14 | 3.77 | 2.427 | 0.64 |
+  | deep | 4.85 | 4.46 | 2.831 | 0.63 |
+  | batch_split | 2.40 | 2.26 | 1.532 | 0.68 |
+  | short_tail | 0.146 | 0.150 | 0.346 | 2.31 |
+  | chain | 0.532 | 0.537 | 0.498 | 0.93 |
+  长序列全线提升 ~6-10%, 短序列持平/微退 (chunk 少, pipeline 开销 > 收益).
+  chain/short_tail 保持原配置 (chain DV=64 st=2, short_tail 结合律 st=2).
+
 | case | student(ms) | t100(ms) | p=t100/t | 估算分 |
 |------|------------|----------|----------|--------|
-| short_tail_state | 0.146 | 0.346 | 2.37 | 120(封顶) |
+| short_tail_state | 0.150 | 0.346 | 2.31 | 120(封顶) |
 | parallel_equal | 0.45 | 0.511 | 1.14 | ~103 |
 | parallel_gva | 0.43 | 0.492 | 1.14 | ~103 |
-| chain_equal | 0.53 | 0.498 | 0.94 | ~97 |
-| long_low_gva | 3.16 | 1.859 | 0.59 | ~81 |
-| batch_split_gva | 2.40 | 1.532 | 0.64 | ~84 |
-| wide_gva_state | 4.14 | 2.427 | 0.59 | ~81 |
-| deep_gva_state | 4.85 | 2.831 | 0.58 | ~81 |
+| chain_equal | 0.537 | 0.498 | 0.93 | ~96 |
+| long_low_gva | 3.04 | 1.859 | 0.61 | ~82 |
+| batch_split_gva | 2.26 | 1.532 | 0.68 | ~85 |
+| wide_gva_state | 3.77 | 2.427 | 0.64 | ~83 |
+| deep_gva_state | 4.46 | 2.831 | 0.63 | ~83 |
 
 **3 个 case 超过 FlashQLA**（short_tail 2.37x, parallel_equal 1.14x, parallel_gva 1.14x）
 ★ 评分公式 p=t100/t, p>1 进 100-120 奖励区. 长序列 4 case p≈0.58-0.64(~81分) 是提分瓶颈.

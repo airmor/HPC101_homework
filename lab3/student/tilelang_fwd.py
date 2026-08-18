@@ -1895,10 +1895,13 @@ def gdn_prefill_forward(
                 block_DV=64, threads=128, num_stages=2,
             )
         else:
+            # ★ 大 grid (long_low/wide/deep/batch_split): DV=128 + num_stages=2
+            # 离线调参发现 st=2 比 st=1 快 ~6% (long_low 3.19→3.00ms).
+            # st=2 让 T.Pipelined 对 shared buffer 自动 multi-version, 跨 chunk load 重叠.
             kernel = _gdn_naive_kernel_matw(
                 batch_size, num_tokens, num_heads_qk, num_heads_v,
                 head_dim_k, head_dim_v,
-                block_DV=128, threads=256, num_stages=1,
+                block_DV=128, threads=256, num_stages=2,
             )
     output, final_state = kernel(q, k, v, g_cumsum, beta, A, initial_state)
     return output, final_state
