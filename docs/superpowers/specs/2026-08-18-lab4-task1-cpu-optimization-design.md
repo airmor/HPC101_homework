@@ -54,11 +54,15 @@
   （arm64-920B 预设）
 - **计算节点**: `hpc submit -p lab4 -c N -- bash ./job_run.sh`
   - lab4 分区：1–60 核，100GB，walltime 30min，镜像 `hpc101-lab4:4`
-  - **关键坑**：计算节点默认 cwd 不是 devpod 的提交 cwd（容器初始 cwd
+  - **关键坑 1**：计算节点默认 cwd 不是 devpod 的提交 cwd（容器初始 cwd
     指向 `/workspace/lab4` 而非 NFS 家目录），导致 `run.sh` 的
-    `ROOT_DIR=$(pwd)` 解析错误、找不到 `build/ABE`。已用 `job_run.sh`
-    包装器解决：显式 `cd` 到家目录 lab4 并 `export AMSS_BUILD_DIR` 等
-    绝对路径。
+    `ROOT_DIR=$(pwd)` 解析错误、找不到 `build/ABE`。`job_run.sh`
+    包装器显式 `cd` 到家目录 lab4 并 `export AMSS_BUILD_DIR` 等绝对路径。
+  - **关键坑 2**：OpenMPI 5/PRRTE 在容器内读不到 cgroup cpuset（容器
+    `nproc=30` 但 PRRTE 默认 slot 数远少于 30，实际分配到的 CPU 列表是
+    `64-93` 这 30 核），`mpiexec -n 30 ./ABE` 报 "not enough slots"。
+    `job_run.sh` 用 `AMSS_MPIEXEC="mpiexec --allow-run-as-root --oversubscribe"`
+    绕过。后续改 MPICH 时此坑不同（MPICH 无 PRRTE slot 概念）。
 - **CPU**: TaiShan-v120（鲲鹏 920B），aarch64，256 核，4 NUMA node
   （每 node 64 核）。任务限 30 核。
 - **默认工具链**: GNU 14 + OpenMPI 5（`gfortran`/`mpicxx`/`mpifort`/`perf`）
