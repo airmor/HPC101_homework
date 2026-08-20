@@ -610,6 +610,8 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 | **TMA load ns=2 (显式 ping-pong _2 buffer)** | shared 超 232KB (273KB) | T.Pipelined 已自动 multi-version, 显式 _2 双重计算爆 shared |
 | **三 kernel 分解 (K1 并行 W/U/ds + K2 串行 S + K3 并行 O)** | **全 PASS 但慢 1.1-1.9x** (chain 1.211, long_low 6.584, wide 12.077) | K2 串行无 T.Pipelined 重叠; W/U/S global 物化往返; DV 整块寄存器压力; 占用率收益被 per-block 工作量轻吃光 |
 | **4-WG 第五轮 照搬 FlashQLA hopper** | 死锁 (kernel 挂起, 5min walltime timeout) | 13 barrier handshake 极复杂; 多 WG arrive_count (96/384/416/256/128) 时序对不齐; 子agent确认 T.barrier 是 T.mbarrier 糖不自动 fence, 但 FlashQLA 靠 T.tma_copy(barrier=) 自动 arrive 避免显式 fence, 我的照搬仍有时序错配 |
+| **Qhat/Khat 换元 (单 WG, 精确零近似)** | **精度全过但性能退步** (chain 0.729 vs 0.53, long_low 3.499 vs 3.04) | 换元 Qhat=γ·Q/Khat=γ_inv·K 消 ds gate + O γ 两处 ew stall, 但 Q/K load 改 T.Parallel element-wise (无法 T.copy 进 pipeline), Khat_shared 新增 16KB + bkg 多读 K, pipeline 退化. 与 TMA load 实验同类失败: element-wise load 在长序列 chunk 多时累积开销大. tilelang 下 load 必须走 T.copy 才进 T.Pipelined |
+| **Prefix-state block-constant output (单 WG, 近似)** | **精度 FAIL, 近似不可用** (block=16 52% mismatch abs 0.10; block=32 62%; block=64 68%) | 数学 O[i]≈scale·γ[i]·Q[i]@(S_old+P[block_start]) 消 Q@Kᵀ+ds@V_new 两 GEMM, state 精确. 但 block-constant 忽略 chunk 内 j<i 的因果 prefix 贡献 (output_in_chunk 项被丢), 误差远超 RTOL=5e-3. torch FP32 验证: block=16 rel>5e-3 frac=97%, abs max 9.4; block=32 rel 98%, abs 18; block=64 rel 99%, abs 18. 近似在 GDN 上不可用 (in-chunk 因果项贡献大, 不能用 block-constant 忽略) |
 
 ### 4-WG 三轮失败的根本原因 (最终结论)
 1. **tilelang 无 4-WG 官方范本**: FlashQLA hopper 是唯一 4-WG (手写 tx), 但其 barrier 极复杂 (13 barrier + 4 producer sub-warp), 远超手写调通能力
@@ -644,11 +646,36 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 
 ---
 
-## 7. 下一步优化方向 (截至 2026-08-18, WY-O+融合第三轮失败后)
+## 7. 下一步优化方向 (截至 2026-08-20, Qhat/Khat + Prefix-state 两路证伪后)
 
 ### 目标: OJ 110 分 (★ 门槛是 p≈1.0)
 评分公式 p=t100/t. 110 分需长序列 p≈1.0 (追平 FlashQLA).
-- long_low: 3.16ms → 需 ~1.86ms (1.7x), wide 4.14→2.43, deep 4.85→2.83, batch 2.40→1.53
+- long_low: 3.04ms → 需 ~1.86ms (1.6x), wide 3.77→2.43, deep 4.46→2.83, batch 2.26→1.53
+
+### ★ Qhat/Khat 换元证伪 (2026-08-20, 精确零近似但性能退步)
+更聪明AI建议第一优先级: 换元 Qhat=γ·Q, Khat=γ_inv·K 消 ds gate (γ_i/γ_j) 与 O γ 两处 ew stall.
+- 数学验证正确 (torch FP32 等价). ds=tril(Qhat@Khatᵀ), O=scale·(Qhat@S_old+ds@V_new), S_new=γr·S_old+Khatᵀ@(γr·V_new).
+- 集群实测 (GDN_QHAT=1): chain_equal 0.729ms (vs matw 0.53, +37%), long_low 3.499ms (vs 3.04, +15%). 精度全过.
+- ★ 退步根因: Q/K load 改 T.Parallel element-wise (Qhat/Khat load 时缩放, 无法 T.copy 走 TMA),
+  T.Pipelined 的 ClassifyCopyLikeStage 只认 T.copy(CopyNode), ew load 从 producer 变 consumer 串行 → pipeline 退化.
+  Khat_shared 新增 16KB + bkg 多读一次 K_shared. 与 TMA load 实验 (长序列 +23%) 同类失败模式.
+- ★ 核心教训: **tilelang 下 load 必须走 T.copy 才进 T.Pipelined pipeline**. 任何把 load 改 element-wise 的换元都会退步.
+  消 ew stall 的收益 < load 退出 pipeline 的代价, 尤其长序列 chunk 多时累积.
+
+### ★ Prefix-state block-constant output 证伪 (2026-08-20, 近似不可用)
+更聪明AI建议第一优先级: O[i]≈scale·γ[i]·Q[i]@(S_old+P[block_start]) 消 Q@Kᵀ + ds@V_new 两 GEMM, state 精确.
+- 集群实测 (GDN_PREFIX=1, block=16): chain_equal 52% mismatch abs 0.10. block=32/64 更差.
+- ★ torch FP32 验证 (block_prefix=16/32/64, state 精确零误差):
+  - block=16: abs max 9.4, rel>5e-3 frac 97%
+  - block=32: abs max 18.0, rel>5e-3 frac 98%
+  - block=64: abs max 18.1, rel>5e-3 frac 99%
+- ★ 根因: block-constant 忽略 chunk 内 j<i 的因果 prefix 贡献 (output_in_chunk = scale·(scores·decay)@v_new 项被丢).
+  GDN 的 in-chunk 因果项贡献大 (decay=tril(exp(g_i-g_j)) 对角线=1, 近对角项不衰减), 不能用 block-constant 忽略.
+  与 attention 的因果 mask 不同: GDN decay 是 exp 差, block 内近对角 token 贡献接近 1, 近似误差大.
+- ★ tilelang 限制: T.gemm 不支持 shared 操作数带首维 offset 切片 ("offset of first dim must be 0"),
+  需用独立 sub-shared buffer (Q_sub/K_sub/Vn_sub) 存子块, 增 shared 开销.
+- ★ 结论: **block-constant 近似在 GDN 上不可用**. 需 local window 修正 (block-prefix + 最近 L token 精确),
+  但 local window 需带宽 GEMM (tril 局部 scores), 又把消掉的 GEMM 加回来, 收益存疑.
 
 ### ★ WY-O 三路全部证伪 (2026-08-18, 单 WG 精度全过但性能全退)
 子agent调研发现 tilelang 有官方 async API (T.wgmma_gemm+T.wait_wgmma, flashmla 先例),
@@ -672,6 +699,8 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
    这些 copy 把省下的 1 GEMM 时间吃光还倒贴. 大 tile 的 TC amortize 收益抵不过 copy.
 4. **async 的 wait(0) 用太狠**: 每 Phase 末 wait(0) 等全部完成, 等于又变同步. 真正藏 ew 需 wait(N) 保留 N 在飞,
    但 fragment 复用让多 GEMM 在飞会冲突 (同一 fragment 被多 GEMM 写).
+5. **(新增) load 退出 pipeline 的代价**: 任何把 T.copy load 改 element-wise 的换元 (Qhat/Khat) 都会让 load 退出
+   T.Pipelined pipeline, 长 chunk 累积开销 > 消 ew 收益. tilelang 下 load 必须保持 T.copy.
 
 ### ★ 4-WG 已穷尽 (三轮失败, 详见第 6 节 + 第 11 节)
 - R1: 手写 tx + matw → 2.7%
@@ -686,8 +715,10 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
 - **state ping-pong shared**: state 不常驻 fragment, 两份 shared ping-pong 降寄存器. 风险: shared 预算紧
 - **per-case autotune (离线)**: 离线搜参后硬编码 (OJ 禁 autotune). 当前 DV 配置已接近最优, 收益小
 - **TMA 替代 async_copy**: T.tma_copy + mbarrier. 需 warp spec 配合, 4-WG 不可行则受限
+- **local window prefix**: block-prefix + 最近 L=4/8 token 精确修正 (带宽 GEMM). 但把消掉的 GEMM 加回来, 收益存疑
 - **实验报告**: 作业页面明确"实验报告是主要评分依据". 三轮 4-WG 踩坑 + WY-O 数学推导 + FlashQLA 源码分析 +
-  WY-O+async+融合三路证伪 (含 tilelang async API 调研) 是报告亮点, 可能比 OJ 93→100 更值
+  WY-O+async+融合三路证伪 + Qhat/Khat 换元证伪 + prefix-state 近似证伪 (含 tilelang async API 调研) 是报告亮点,
+  可能比 OJ 93→100 更值
 
 ---
 
