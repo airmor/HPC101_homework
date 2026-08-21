@@ -927,7 +927,11 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                 for t, d in T.Parallel(block_S, DK):
                     bkg_shared[t, d] = T.cast(
                         T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
-                T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)   # W
+                T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)   # W (FP32 frag)
+                # ★ W 截断到 BF16 shared (原方式), 但直接用 W_shared 做 RS: T.gemm(W_shared, s_shared, ...)
+                #   W_shared 是 BF16 shared, s_shared 是 BF16 shared → SS GEMM, 非 RS.
+                #   RS 需要 A=fragment. 但 fragment→fragment cast (FP32→BF16) layout 冲突.
+                #   ★ 正确: W 保留在 shared, 直接 W@S (原 matw). RS 暂不可行 (layout conflict).
                 T.copy(tmp_dv, W_shared)
 
                 # βV, U=A@βV
@@ -937,23 +941,24 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                 T.gemm(A_shared, bv_shared, tmp_dv2, clear_accum=True)   # U
                 T.copy(tmp_dv2, bv_shared)   # bv_shared = U
 
-                # ds = Lower(QKᵀ) ⊙ (g_exp_i * g_inv_j)  (复用, 无 exp2)
+                # ds = Lower(QKᵀ) ⊙ (g_exp_i * g_inv_j)
                 T.gemm(Q_shared, K_shared, ds_tmp, transpose_B=True, clear_accum=True)
                 for i, j in T.Parallel(block_S, block_S):
                     if i >= j:
                         ds_tmp[i, j] = ds_tmp[i, j] * g_exp_shared[i] * g_inv_shared[j]
                     else:
                         ds_tmp[i, j] = 0
+                # ★ ds 截断到 BF16 shared (原方式, RS 不可行因 layout conflict)
                 T.copy(ds_tmp, ds_shared)
 
-                # P2: V_new = U - W@S (直接 W@S, 无结合律)
+                # P2: V_new = U - W@S
                 T.copy(s_fragment, s_shared)
-                T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)   # tmp_dv2 = W@S
+                T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)   # W@S
                 for t, d in T.Parallel(block_S, block_DV):
-                    tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new = U - W@S
+                    tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new
                 T.copy(tmp_dv2, V_new_shared)
 
-                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new) (独立 O_fragment, V_new 在 tmp_dv2 但已 copy 走)
+                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new)
                 O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
                 T.gemm(Q_shared, s_shared, O_fragment, clear_accum=True)
                 for t, d in T.Parallel(block_S, block_DV):
