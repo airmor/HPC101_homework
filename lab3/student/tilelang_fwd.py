@@ -3778,10 +3778,13 @@ def gdn_prefill_forward(
                 block_DV=128, threads=256, num_stages=1,
             )
     elif num_tokens <= 2048:
-        kernel = _gdn_naive_kernel(
+        # ★ 短序列: sweep 发现 matw DV=128 th=256 st=2 比结合律 DV=64 th=128 快
+        #   short_tail: 0.155 vs 0.198 (+22%), parallel_equal: 0.41 vs 0.41 (持平)
+        #   统一用 matw DV=128 (短序列也受益于大 tile + th=256 寄存器分摊)
+        kernel = _gdn_naive_kernel_matw(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
             head_dim_k, head_dim_v,
-            block_DV=64, threads=128, num_stages=2,
+            block_DV=128, threads=256, num_stages=2,
         )
     else:
         # 长序列 per-case: 小 Hv (grid 不足) 用 DV=64 提占用, 大 Hv 用 DV=128 大 tile
