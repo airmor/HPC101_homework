@@ -245,6 +245,22 @@ else:
   short_tail=0.346, chain=0.498, parallel_equal=0.511, parallel_gva=0.492,
   long_low=1.859, batch_split=1.532, wide=2.427, deep=2.831
 
+★ FLA / FlashInfer 实测时间 (2026-08-21, --reference-benchmarks full_forward):
+  | case | FlashQLA | FLA | FlashInfer |
+  |------|----------|-----|------------|
+  | short_tail_state | 0.270 | 0.459 | 0.304 |
+  | chain_equal | 0.464 | 0.951 | 0.793 |
+  | parallel_equal | 0.462 | 0.945 | 0.473 |
+  | parallel_gva | 0.440 | 0.843 | 0.447 |
+  | long_low_gva | 1.829 | 6.447 | 1.804 |
+  | batch_split_gva | 1.812 | 6.161 | 1.445 |
+  | wide_gva_state | 3.346 | 12.555 | 2.405 |
+  | deep_gva_state | 3.617 | 12.823 | 2.658 |
+  ★ FLA 在所有 case 都是最慢的 (长序列慢 3-4x FlashQLA).
+  ★ 作业页面 t60 (60分 checkpoint) = 0.574/4.000/2.017/... 与 FLA 时间不符 (FLA chain 0.951 vs t60 4.000).
+    故 t60 不是 FLA 时间, 是另一个 checkpoint (可能是某个固定分数对应的实现, 非 FLA).
+  ★ FlashInfer 长序列最快 (long_low 1.804 vs FlashQLA 1.829), 短序列 FLA 最慢.
+
 ★ num_stages=2 微优化 (2026-08-19): 大 grid 长序列 matw 从 st=1 改 st=2,
   T.Pipelined 自动 multi-version shared buffer, 跨 chunk load 重叠:
   | case | st=1 (旧) | st=2 (新) | t100 | p (新) |
