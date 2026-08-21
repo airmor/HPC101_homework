@@ -789,7 +789,14 @@ def _gdn_naive_kernel_matw_fulltile(B, S, Hq, Hv, DK, DV, block_DV=128, threads=
                     O[bb, left + t, bh, bv * block_DV + d] = T.cast(
                         (DK ** -0.5) * O_fragment[t, d], T.bfloat16)
 
-                # state
+                # ★ state: 用系数化 S_new = γr·S_old - C@S_old + B (替代 V_new → Kᵀ@V_new)
+                #   C = Kᵀ@(R⊙W), B = Kᵀ@(R⊙U), R = exp(g_last - g)
+                #   state critical path: W@S (已算 for V_new) → 系数化省 Kᵀ@V_new, 但加 C@S_old
+                #   net: 原 matw state = γr·S_old + Kᵀ@(γr·γ_inv·V_new) = γr·S_old - C@S_old + B
+                #   原路径: W@S(已算), gate V_new, Kᵀ@V_new (1 GEMM + ew)
+                #   系数路径: C=Kᵀ@(R⊙W), B=Kᵀ@(R⊙U), C@S_old (2 GEMM + ew, 但 C/B 与 output 系数 P/R 共享 W/U)
+                #   ★ 不省 GEMM 数, 但 C/B 可与 output 的 ds@W/ds@U 并发 (都读 W/U). 暂不做.
+                # 先保持原 matw state (精确, 无系数化):
                 for t, d in T.Parallel(block_S, block_DV):
                     tmp_dv2[t, d] = tmp_dv2[t, d] * gl_local[0] * g_inv_shared[t]
                 T.copy(tmp_dv2, V_new_shared)
@@ -852,7 +859,6 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
 
             g_shared = T.alloc_shared((block_S,), dtype=T.float32)
             beta_shared = T.alloc_shared((block_S,), dtype=T.float32)
-            # 预算 exp(g)/1/exp(g)/beta*g_exp, 复用省 exp2
             g_exp_shared = T.alloc_shared((block_S,), dtype=T.float32)
             g_inv_shared = T.alloc_shared((block_S,), dtype=T.float32)
             beta_g_shared = T.alloc_shared((block_S,), dtype=T.float32)
@@ -916,18 +922,18 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                     g_inv_shared[t] = T.exp2(-g_shared[t] * LOG2E)
                     beta_g_shared[t] = beta_shared[t] * g_exp_shared[t]
 
-                # P1: βγK, W=A@(K⊙beta_g) (物化 W, 复用 beta_g)
+                # βγK, W=A@(K⊙beta_g)
                 for t, d in T.Parallel(block_S, DK):
                     bkg_shared[t, d] = T.cast(
                         T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
-                T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)   # tmp_dv [64,128] = W
+                T.gemm(A_shared, bkg_shared, tmp_dv, clear_accum=True)   # W
                 T.copy(tmp_dv, W_shared)
 
-                # βV, U=A@βV -> bv_shared
+                # βV, U=A@βV
                 for t, d in T.Parallel(block_S, block_DV):
                     bv_shared[t, d] = T.cast(
                         T.cast(V_shared[t, d], T.float32) * beta_shared[t], T.bfloat16)
-                T.gemm(A_shared, bv_shared, tmp_dv2, clear_accum=True)   # tmp_dv2 [64,block_DV] = U
+                T.gemm(A_shared, bv_shared, tmp_dv2, clear_accum=True)   # U
                 T.copy(tmp_dv2, bv_shared)   # bv_shared = U
 
                 # ds = Lower(QKᵀ) ⊙ (g_exp_i * g_inv_j)  (复用, 无 exp2)
@@ -942,12 +948,11 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                 # P2: V_new = U - W@S (直接 W@S, 无结合律)
                 T.copy(s_fragment, s_shared)
                 T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)   # tmp_dv2 = W@S
-                T.copy(bv_shared, O_fragment)   # O_fragment = U
                 for t, d in T.Parallel(block_S, block_DV):
-                    tmp_dv2[t, d] = O_fragment[t, d] - tmp_dv2[t, d]   # tmp_dv2 = V_new
+                    tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new = U - W@S
                 T.copy(tmp_dv2, V_new_shared)
 
-                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new)  (复用 g_exp, 无 exp2)
+                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new)
                 T.gemm(Q_shared, s_shared, O_fragment, clear_accum=True)
                 for t, d in T.Parallel(block_S, block_DV):
                     O_fragment[t, d] = g_exp_shared[t] * O_fragment[t, d]
@@ -3511,6 +3516,8 @@ def gdn_prefill_forward(
     _STACKWU = os.environ.get("GDN_STACKWU", "0") == "1"
     _SPDV2 = os.environ.get("GDN_SPDV2", "0") == "1"
     _FULLTILE = os.environ.get("GDN_FULLTILE", "0") == "1"
+    _FORCE_DV64 = os.environ.get("GDN_DV64", "0") == "1"
+    _FORCE_DV64_TH256 = os.environ.get("GDN_DV64_TH256", "0") == "1"
     _SO = os.environ.get("GDN_SO", "0") == "1"
     _SOF = os.environ.get("GDN_SOF", "0") == "1"
     if _WS4_FQLA and (num_tokens % CHUNK_SIZE == 0):
@@ -3767,8 +3774,20 @@ def gdn_prefill_forward(
         # 长序列 per-case: 小 Hv (grid 不足) 用 DV=64 提占用, 大 Hv 用 DV=128 大 tile
         # OJ 实测: chain_equal(Hv=4) DV=64=0.53ms(94分) vs DV=128=0.84ms(74分)
         #          long_low/wide/deep/batch_split DV=128 最优
+        # ★ ncu: long_low reg=250, waves=0.57 (8 CTA / 14 SM, 不足 1 波), TC=15.6%.
+        #   250 reg/thread 限制占用率; waves 0.57 说明 SM 未填满 (grid=8 < 14 SM).
+        #   TC 15.6% 说明 GEMM 串行 + ew stall 主导, 非 TC 本身瓶颈.
+        # ★ GDN_DV64=1: 强制 DV=64 (grid 翻倍 16 CTA), 测试 SM 占用对 long_low 的影响.
         _grid = batch_size * num_heads_v
-        if _grid <= 4:
+        _force_dv64 = os.environ.get("GDN_DV64", "0") == "1"
+        if _force_dv64:
+            _dv64_th = 256 if os.environ.get("GDN_DV64_TH256", "0") == "1" else 128
+            kernel = _gdn_naive_kernel_matw(
+                batch_size, num_tokens, num_heads_qk, num_heads_v,
+                head_dim_k, head_dim_v,
+                block_DV=64, threads=_dv64_th, num_stages=2,
+            )
+        elif _grid <= 4:
             # chain(Hv=4)/hidden-2: 小 grid, DV=64 grid 翻倍提 SM 占用
             kernel = _gdn_naive_kernel_matw(
                 batch_size, num_tokens, num_heads_qk, num_heads_v,
