@@ -865,10 +865,11 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
             g_last_local = T.alloc_local((1,), T.float32)
             gl_local = T.alloc_local((1,), T.float32)
 
-            tmp_dv = T.alloc_fragment((block_S, DK), dtype=T.float32)  # 最大 [64,128] (W 产出)
-            tmp_dv2 = T.alloc_fragment((block_S, block_DV), dtype=T.float32)  # V_new/O 等 [64,block_DV]
+            tmp_dv = T.alloc_fragment((block_S, DK), dtype=T.float32)  # W → 复用为 ds@V_new accumulator
+            tmp_dv2 = T.alloc_fragment((block_S, block_DV), dtype=T.float32)  # U → W@S → V_new → O (复用)
             ds_tmp = T.alloc_fragment((block_S, block_S), dtype=T.float32)
-            O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+            # ★ O_fragment 复用 tmp_dv2: Q@S_old 写 tmp_dv2 (U 已 copy 走), 然后 ds@V_new clear_accum=False
+            #   去掉独立 O_fragment, 省一个 [64,128] fragment = 32 FP32 reg/thread
 
             T.annotate_layout({
                 V_shared: tilelang.layout.make_swizzled_layout(V_shared),
@@ -952,7 +953,8 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                     tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new = U - W@S
                 T.copy(tmp_dv2, V_new_shared)
 
-                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new)
+                # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new) (独立 O_fragment, V_new 在 tmp_dv2 但已 copy 走)
+                O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
                 T.gemm(Q_shared, s_shared, O_fragment, clear_accum=True)
                 for t, d in T.Parallel(block_S, block_DV):
                     O_fragment[t, d] = g_exp_shared[t] * O_fragment[t, d]
