@@ -955,8 +955,10 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                 T.copy(s_fragment, s_shared)
                 T.gemm(W_shared, s_shared, tmp_dv2, clear_accum=True)   # W@S
                 for t, d in T.Parallel(block_S, block_DV):
-                    tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new
-                T.copy(tmp_dv2, V_new_shared)
+                    tmp_dv2[t, d] = T.cast(bv_shared[t, d], T.float32) - tmp_dv2[t, d]   # V_new (ungated)
+                # ★ V_new 不 copy 回 shared, ds@V_new 用 tmp_dv2(frag) — 但 B 必须 shared.
+                #   需 V_new_shared. 但可延后: 先算 Q@S_old (不依赖 V_new), 再 copy V_new.
+                T.copy(tmp_dv2, V_new_shared)   # V_new_shared = ungated V_new (供 ds@V_new + 后续 gate)
 
                 # P3: O = scale*(γ⊙(Q@S_old) + ds@V_new)
                 O_fragment = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
@@ -970,6 +972,10 @@ def _gdn_naive_kernel_matw(B, S, Hq, Hv, DK, DV, block_DV=128, threads=256, num_
                             (DK ** -0.5) * O_fragment[t, d], T.bfloat16)
 
                 # 更新 state: gate V_new *= gl * g_inv (复用, 无 exp2)
+                # ★ 原地 gate tmp_dv2 (V_new), 不 copy 回 V_new_shared, 直接做 Kᵀ@(gated V_new)
+                #   消一次 frag→shared copy (T.copy(tmp_dv2, V_new_shared)) + shared 读取
+                #   Kᵀ@gated_V_new: K_shared @ tmp_dv2(frag) → 需要 B=fragment, 但 T.gemm B 必须 shared.
+                #   故仍需 copy. 但可省第二次 V_new_shared (gated) 的 copy: 直接 gate in-place + copy once.
                 for t, d in T.Parallel(block_S, block_DV):
                     tmp_dv2[t, d] = tmp_dv2[t, d] * gl_local[0] * g_inv_shared[t]
                 T.copy(tmp_dv2, V_new_shared)

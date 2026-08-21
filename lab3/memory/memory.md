@@ -300,16 +300,22 @@ else:
 
 ## 5. ncu 分析数据 (long_low_gva, 物化W版+exp复用+autotune DV=128)
 
-| 指标 | v1 朴素 | v8 (DV=64) | 最终 (DV=128,th=256) | 目标 |
-|------|---------|--------|--------|------|
-| reg/thread | 255 | 220 | ~160 (th=256 分摊) | <128 (让 2 block/SM) |
-| TC 利用率 | 13.8% | 13.9% | 待测 (预期升) | >50% |
-| fmul 指令数 | 383M | 339M | 待测 | 更低 |
-| waves/SM | 1.14 | 1.14 | 待测 | >2 |
-| `__launch_bounds__` | (128, 1) | (128, 1) | (256, 1) | (128, 2) |
+| 指标 | v1 朴素 | v8 (DV=64) | 最终 (DV=128,th=256) | DV=64 th=128 | DV=64 th=256 | set_max_nreg(160) | 目标 |
+|------|---------|--------|--------|--------|--------|--------|------|
+| reg/thread | 255 | 220 | **250** | 220 | 186 | 160 | <128 (让 2 block/SM) |
+| TC 利用率 | 13.8% | 13.9% | **15.6%** | 13.9% | 13.0% | 11.5% | >50% |
+| waves/SM | 1.14 | 1.14 | **0.57** | 1.14 | 1.14 | 0.57 | >2 |
+| shared (dynamic) | — | — | 222976 B | — | — | — | <232KB |
 
-**核心瓶颈仍存**: 即便 threads=256 分摊寄存器到 2 warp group，TC 利用率仍受限于 element-wise 与 GEMM 串行（单 warp 组下 TC 等 element-wise 跑完才轮到）。
-autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + 寄存器分摊降压力 + 单级流水减 buffer，三者协同。
+**★ ncu 完整分析 (2026-08-21)**:
+- long_low DV=128: reg=250, waves=0.57 (grid=8 < 14 SM, 不足 1 波), TC=15.6%.
+  ★ TC 15.6% = 真正瓶颈: 84% 时间 TC idle, 等 ew/copy/stall.
+  ★ waves=0.57 不变是 grid=8 < 14 SM 导致, 非 reg 限制 (set_max_nreg(160) reg 降但 waves 不变, TC 反降).
+  ★ DV=64 翻 grid=16 (waves 1.14) 但 TC 降 (13.9% vs 15.6%), 净退步 (long_low 3.04→4.00ms).
+  ★ async wgmma 无收益 (单 WG issue 串行, wait 增开销).
+  ★ set_max_nreg 无收益 (grid 限制非 reg 限制, spill 反降 TC).
+  ★ RS GEMM (fragment A) 不可行 (layout infer conflict: FP32→BF16 fragment cast 在 T.Parallel 内 layout 不匹配).
+- 核心瓶颈: TC 15.6% idle 84%, ew/copy stall 主导. 单 WG 无法藏 ew (需 4-WG, 但不可行).
 
 ---
 
@@ -448,8 +454,7 @@ autotune 的 DV=128+th=256+st=1 突破点在于: 大 tile 提升 mma 效率 + �
   - 说明 nan 不来自计算, 来自 **最基础的 producer→consumer data_ready 同步** (element-wise load + fence + arrive → consumer wait + 读)
 - 回退到 466c000 基线
 
-### 4-WG 第三轮 (T.ws 调研反转 + FlashQLA 配置 + WY-O, **仍未通**)
-- **子 agent 源码调研 (关键反转)**:
+### 4-WG 第三轮 (T.ws 调研反转 + FlashQLA 配置 + WY-O, **仍未通**)- **子 agent 源码调研 (关键反转)**:
   - `T.ws(N)` 语法不限 N，但 `producer_consumer_ws.cc` **只支持 2 分区**! 4 分区代码生成零验证
   - ★ FlashQLA hopper 版是 **TileLang** (非 CUDA), 4-WG threads=512, 用**手写 tx if/elif 4 分支**(和前两轮一样)
   - tilelang 作者写 4-WG 时都绕过 T.ws 用手写 tx → 手写 tx 本身不是 bug 根源
