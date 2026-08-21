@@ -1035,3 +1035,741 @@ threads/block_DV/num_stages: 同 matw (chain DV=64/th=128/st=2; 大 grid DV=128/
     issue 仍串行, wait 同步点反而增加开销. 这条路在 4-WG 不可行时是死路.
 ```
 
+
+# 17. 真正瓶颈重判：不是“少了哪一个 GEMM”，而是 CTA 数量、state critical path 与 load pipeline
+
+- 日期：2026-08-21
+- 结论级别：这是下一轮优化的总判断，低级 AI 不应再先尝试新的 WY / prefix 恒等式，先按本节的执行结构路线做实验。
+
+## 17.1 先把昨天的失败解释清楚
+
+昨天的数学路线并不是数学推导错误，而是优化目标选错了：
+
+1. `Q@K^T` 与 `ds@V_new` 的 FMA 合计约为 `0.524M + 0.524M = 1.048M`。
+2. 每个 chunk 的总 FMA 约为：
+
+```text
+W=A@(beta*gamma*K)       1.048M
+U=A@(beta*V)             1.048M
+W@S_old                  1.048M
+Q@S_old                  1.048M
+K^T@V_new                1.048M
+Q@K^T                    0.524M
+ds@V_new                 0.524M
+总计                      6.288M FMA
+```
+
+因此即使把 `Q@K^T` 和 `ds@V_new` 完全免费，FLOP 上限也只有 `6.288 / 5.240 = 1.20x`。而 OJ 110 需要长序列约 `1.6x`。这条路从上限上就不够。
+
+更重要的是，真正不能被普通代数消掉的依赖链是：
+
+```text
+S_old
+  -> W@S_old
+  -> V_new = U - W@S_old
+  -> K^T@V_new
+  -> S_new
+```
+
+`Q@S_old` 和 `ds@V_new` 属于 output 分支；`W@S_old -> V_new -> K^T@V_new` 才是跨 chunk state 的硬依赖。WY 只是把成本移动到 `ds@W`、Q' 写回、额外 fragment 和同步上，并没有消掉这条链。
+
+## 17.2 当前 matw 的三个真正瓶颈候选
+
+### A. 长序列低 head 数时，grid 太小
+
+`long_low` 是 `B=1, Hv=8`，当前 `block_DV=128` 时 grid 只有 8 个 CTA；H800 MIG 只有约 14 个 SM，最多只有 8 个 SM 有 CTA，至少一部分 SM 空闲。一个 CTA 内的 512 个 chunk 又必须沿 state 顺序执行，因此不能靠更多 chunk 并行来填满机器。
+
+这解释了为什么：
+
+- `DV=64` 以前虽然把 grid 变成 16，但因为每个 DV tile 重复计算 W 和 ds/QK，反而从约 3.04ms 退化到约 4.06ms；
+- 这里不是“DV=64 不好”，而是“DV split 后重复了与 DV 无关的工作”；
+- 这是一个空间/时间甜点：**把 DV 拆开增加 CTA，同时把 W 与 QK/ds 从 split tile 中抽出来，只计算一次**。
+
+### B. 单 WG / 单 CTA 内 state critical path 太长
+
+当前每个 `T.gemm` 默认隐式 `wait_group 0`。之前的单 WG async 实验已经证明：只把多个 GEMM 改成 `T.wgmma_gemm`，在小 grid 上 launch/同步开销反而更明显，大 grid 上又被 accumulator 寄存器压力抵消。因此继续堆 async batch 不是主路。
+
+需要改变的是“一个 CTA 包揽一个 DV tile 的全部工作”这一执行结构，而不是继续改 GEMM 的代数顺序。
+
+### C. matw 的输入 load 不是有效的 producer pipeline
+
+当前 `_gdn_naive_kernel_matw` 在 `T.Pipelined` 内用的是：
+
+```python
+for t, d in T.Parallel(...):
+    Q_shared[t, d] = Q[...]
+    K_shared[t, d] = K[...]
+    V_shared[t, d] = V[...]
+    A_shared[t, d] = A[...]
+```
+
+这些是 element-wise load，不是 `CopyNode` 的 global-to-shared `T.copy`。TileLang 的 pipeline planner 只有识别到 `T.copy(global, shared)` 才会把该语句放入 producer stage；所以现在的 `T.Pipelined` 主要是在做 buffer versioning，并没有保证 load 与 compute 真正重叠。
+
+之前的 TMA 版本变慢不能证明“异步 load 没用”，它同时引入了 TMA descriptor / mbarrier / 调度开销。下一次应单独验证 **无尾块的普通 `T.copy` + `T.Pipelined`**，不要把它和 TMA 混在一起。
+
+## 17.3 第一优先级新路线：精确的“state-independent precompute + DV split”
+
+暂命名：`SP-DV2`（State-independent Precompute + 2-way DV split）。它不是近似，不改变数学结果，不会产生跨 chunk 误差累积。
+
+### Kernel A：每个 chunk 只预计算一次与 DV 无关的量
+
+对每个 `(B, chunk, V-head)` 计算并写入 BF16 workspace：
+
+```text
+W_h,c = A_h,c @ (beta_h,c * exp(g_h,c) * K_h,c)   [64,128]
+```
+
+同时，对每个 `(B, chunk, Q-head)` 只计算一次 raw score：
+
+```text
+R_q,c = Q_q,c @ K_q,c^T                           [64,64]
+```
+
+主 kernel 对每个 V head 再用本 head 的 gate 做：
+
+```text
+ds_h,c[i,j] = tril(R_q,c[i,j] * exp(g_h[i]) * exp(-g_h[j]))
+```
+
+这样可以同时利用两个性质：
+
+- `W` 与 DV tile 无关；
+- GVA 下一个 Q head 对应多个 V head，raw `Q@K^T` 可以跨 V head 复用，gate 只在主 kernel 中逐 head 缩放。
+
+Kernel A 可以先做成一个简单的独立预处理 kernel；若低级 AI 想减少 launch，可在同一个预处理 kernel 中让每个 `bh % G == 0` 的 CTA 额外计算 raw score，其余 V head CTA 只算 W。
+
+### Kernel B：每个 V head 拆成两个 DV=64 CTA
+
+每个 split CTA 只负责一个 `[64,64]` 的 DV tile：
+
+```text
+U       = A@(beta*V_tile)       [64,64]
+W@S     = W_shared@S_old        [64,64]
+Q@S     = Q@S_old               [64,64]
+ds@V   = ds@V_new_tile         [64,64]
+K^T@V  = K^T@V_new_tile         [128,64]
+```
+
+两个 DV CTA：
+
+- 读取同一个预计算的 W；
+- 读取同一个 raw QK（或 ds workspace）；
+- 各自读取不同的 V / state 列；
+- 各自写 output 的不同 DV 列；
+- 各自写 final_state 的不同 DV 列；
+- 没有 CTA 间 state 依赖，因为 state recurrence 只沿 chunk 方向、每个 DV 列独立。
+
+### 为什么这可能是 110 所需的结构性加速
+
+原始 `DV=128` 一个 CTA 的每 chunk 工作是约 6.288M FMA，并且所有工作被同一个低数量 grid 串行承载。
+
+SP-DV2 不减少总 FMA（除 GVA raw-QK 复用外），但把工作拆成：
+
+```text
+预处理阶段：W + raw-QK，约占每 head 25% 左右的工作
+主阶段：两个 DV=64 CTA，各承载剩余的 DV-dependent 工作
+```
+
+对 `long_low`：
+
+- 原始：8 个 CTA，约 8 个 SM 承担全部工作；
+- 预处理：仍是 8 个 CTA，但只承担小部分 state-independent 工作；
+- 主阶段：16 个 CTA，能覆盖 14 个 SM；
+- 理想化 wall-time 近似：
+
+```text
+原始： (Wpre + Wmain) / 8
+新式： Wpre / 8 + Wmain / 16
+```
+
+当 `Wpre` 约占 1/4 时，理论上接近 `1.6x`，这正好对应 long_low 从约 3.04ms 逼近 1.86ms 所需的量级。实际会被额外 global workspace 读写、DV=64 的 WGMMA 效率、第二次 kernel launch 抵消一部分，但它是目前第一个**理论上能解释 1.6x 来源**的路线。
+
+### Workspace 容量计算
+
+只存 BF16：
+
+```text
+W workspace：       [B, C, Hv, 64, 128] BF16 = 16 KiB * B*C*Hv
+raw-QK workspace：  [B, C, Hq, 64, 64]  BF16 =  8 KiB * B*C*Hq
+```
+
+8 个评测 case 的最大值：
+
+| case | W workspace | raw-QK workspace | 合计 |
+|---|---:|---:|---:|
+| short_tail_state | 2.125 MiB | 0.133 MiB | 2.258 MiB |
+| chain_equal | 8 MiB | 8 MiB | 16 MiB |
+| parallel_equal | 8 MiB | 4 MiB | 12 MiB |
+| parallel_gva | 8 MiB | 1 MiB | 9 MiB |
+| long_low | 64 MiB | 8 MiB | 72 MiB |
+| batch_split | 64 MiB | 8 MiB | 72 MiB |
+| wide_gva_state | 128 MiB | 16 MiB | 144 MiB |
+| deep_gva_state | 128 MiB | 16 MiB | 144 MiB |
+
+最大约 144 MiB，远小于 10 GiB GPU 显存；它不占 CTA shared memory，不会触发 232 KiB 动态 shared 限制。workspace 只在 SP-DV2 路线分配，不能把它误算成 shared。
+
+若不想让主 kernel 做 raw-QK gate scaling，也可以直接存每个 V head 的 gated `ds`：
+
+```text
+W + ds：24 KiB * B*C*Hv
+```
+
+最大约 192 MiB，仍然完全可接受，但会失去 GVA 的 raw-QK 复用。建议先实现 raw-QK 版，若索引或 gate scaling 增加太多开销，再退回 gated-ds 版。
+
+### 精度与同步要求
+
+- workspace 用 BF16，保持与当前 matw 的 W/shared 与 ds/shared 截断位置一致；
+- 不允许近似，不允许低秩截断；
+- 两个 split CTA 只写不重叠的 DV 区间，不需要 CTA 间 barrier；
+- `initial_state` 和 `final_state` 按 DV slice 切分；
+- `short_tail_state` 继续走旧 kernel，SP-DV2 第一版只处理 `T % 64 == 0`；
+- 第一实验只开 `long_low`，不要同时改 wide/deep，先证明 3.04ms 是否能显著下降。
+
+## 17.4 第二优先级：精确输出水平拼接，而不是 `[ds;K^T]` 竖直拼接
+
+之前尝试的 `[ds; K^T] @ V_new` 是 `M=192`，会拉大输出 fragment、寄存器和 warp partition；它主要减少 API 次数，不减少 Tensor Core FMA，优先级不高。
+
+更适合 Hopper 的拼接是输出式：
+
+```text
+O / scale = Qhat @ S_old + ds @ V_new
+
+Qhat = exp(g) * Q
+L = [ Qhat | ds ]       [64, 192]
+R = [ S_old            ] [192, DV]
+    [ V_new            ]
+
+O = L @ R               [64, DV]
+```
+
+它保持 `M=64`，只是把 `K=128 + 64 = 192`，通常比 `M=192` 更不伤 warp partition。
+
+### shared 容量
+
+```text
+Q_shared + ds_shared       = 64*128*2 + 64*64*2  = 24 KiB
+Qds_shared[64,192]         = 64*192*2           = 24 KiB
+
+S_shared + V_new_shared   = 128*128*2 + 64*128*2 = 48 KiB
+SV_shared[192,128]         = 192*128*2           = 48 KiB
+```
+
+所以从“数学中间存储”看是够的，关键是做 lifetime coloring，而不是再新增一份大 buffer。注意 TileLang 对 shared 第一维非零 offset 的 `T.gemm` 支持有限；优先安排 `S` 位于 `SV` 的首 128 行，`V_new` 另用可复用的旧 `V_shared` / `s_shared` 低 64 行，避免直接把 `SV[128:192]` 当 GEMM B operand。若最终必须多保留 16 KiB V buffer，也要先检查动态 shared 是否仍低于约 227 KiB。
+
+这条路线预期是 5%~12% 级别，不是 1.6x 主路线；只有 SP-DV2 证明方向正确后才值得做。
+
+## 17.5 第三优先级：无尾块 fast path 恢复普通 T.copy pipeline
+
+对 `T % 64 == 0` 的 long/wide/deep/batch case，另写一个无边界判断的 fast kernel：
+
+```python
+T.copy(Q[...], Q_shared)
+T.copy(K[...], K_shared)
+T.copy(V[...], V_shared)
+T.copy(A[...], A_shared)
+T.copy(g_cumsum[...], g_shared)
+T.copy(beta[...], beta_shared)
+```
+
+不要写成 `T.Parallel` 的逐元素 global load。tail case 单独继续走旧 kernel。
+
+当前 matw 的静态 shared 粗略约 161 KiB；若 `num_stages=2` 只对输入 buffer 做版本化，新增 Q/K/V/A/g/beta 约 58 KiB，总量约 219 KiB，理论上仍低于 MIG 动态上限约 227 KiB，但必须让低级 AI 编译确认实际值。若超限，优先只对 Q/K/V 三个大输入做双 buffer，A/g/beta 保持单 buffer。
+
+这条路线不改数学，目标是验证当前真正被遗漏的 load-compute overlap。TMA 退化不代表普通 `T.copy` 退化；两者 descriptor、barrier 和调度成本不同，不能混为一谈。
+
+## 17.6 不再优先尝试的路线
+
+1. 继续寻找只删除 QK 或 dsV 的恒等式：FLOP 上限不够。
+2. block-prefix / block-constant output：GDN chunk 内近邻 decay 接近 1，误差结构性很大。
+3. WY-O 单 WG：新增 ds@W、共享写回与寄存器压力，实测已退步。
+4. 单 WG async batch：之前已证明小 grid 变慢、大 grid 近似持平，不能改变 CTA 数量。
+5. `[ds;K^T]@V_new` M=192：主要节省调用，不减少 Tensor Core 工作，且寄存器风险更大。
+6. 低秩跨 chunk affine scan：理论上能打破 state serial，但误差会跨 chunk 累积，且 affine 矩阵组合成本接近重新计算；除非所有执行结构路线失败，不进入短期实现。
+
+## 17.7 低级 AI 的实验顺序与判定标准
+
+### Experiment 1：full-tile `T.copy` pipeline
+
+- 只改 long_low 对应的无尾块 kernel；
+- 保持 DV=128、数学和 state 顺序不变；
+- 若 long_low 至少下降 10%，说明 load pipeline 是真实瓶颈之一；
+- 若 shared 超限，记录实际动态 shared，不要直接放弃，减少版本化 buffer。
+
+### Experiment 2：SP-DV2 gated-ds 版（先不做 GVA raw-QK）
+
+- 预处理 W/ds workspace；
+- 主 kernel DV=64、threads=128，两个 CTA/head；
+- 只开 long_low；
+- 目标：精度 8 case 全过，long_low 明显优于 3.04ms；
+- 若性能不降反升，优先检查 W/ds workspace 的 global read、第二次 launch 与 DV=64 WGMMA 效率，而不是怀疑数学。
+
+### Experiment 3：SP-DV2 raw-QK GVA 版
+
+- 仅对 `Hv/Hq > 1` 开启；
+- 比较 wide/deep/long_low；
+- 预期额外收益来自跨 V head 复用 raw QK，而不是 approximation。
+
+### Experiment 4：输出水平拼接
+
+- 只在 SP-DV2 或 full-tile fast path 稳定后做；
+- 记录 shared 实际占用和 K=192 GEMM 的生成形态；
+- 若低于 5% 收益或出现 shared/寄存器退化，立即回退。
+
+### 总结
+
+昨天数学优化失败的根因不是“中间存储永远不够”，而是：
+
+```text
+数学删除的工作量太小
++ 精确 state recurrence 仍然存在
++ 单 CTA / 单 WG 承载了过长 critical path
++ long_low grid 不足以填满 14 SM
++ 当前 matw load 没有真正进入 producer pipeline
+```
+
+目前最值得实现的不是另一个 WY 公式，而是：
+
+```text
+先用 exact state-independent workspace 把 DV split 的重复 W/ds 拿掉，
+再用 DV=64 增加 CTA 数量；同时对无尾块验证普通 T.copy pipeline。
+```
+
+这两条分别攻击“低 occupancy”和“load-compute 不重叠”，是目前唯一可能从 93 分跨到 110 分附近的路线。
+
+---
+
+# 18. 新主路线：中间只做 `S_new`，output 延后（State-only critical stage）
+
+- 日期：2026-08-21
+- 状态：高层数学设计，待低级 AI 先做 reference 数学验证，再决定实现。
+- 用户指定目标：把中间阶段化成只更新 `S_new` 的最简形式；output 不在中间阶段计算，而放到后续阶段。
+
+## 18.1 先把递推完全展开
+
+记：
+
+```text
+r_i       = exp(g_last - g_i)
+R         = diag(r_i)
+W         = A @ (beta * exp(g) * K)
+U         = A @ (beta * V)
+V_new     = U - W @ S_old
+```
+
+原始 state 更新为：
+
+```text
+S_new = exp(g_last) * S_old + K^T @ R @ V_new
+```
+
+代入 `V_new`：
+
+```text
+S_new
+= exp(g_last) * S_old + K^T @ R @ U - K^T @ R @ W @ S_old
+```
+
+定义两个只依赖当前 chunk 输入的系数：
+
+```text
+C = K^T @ R @ W       # [DK, DK]
+B = K^T @ R @ U       # [DK, DV]
+```
+
+则中间阶段的最简 state-only 形式是：
+
+```text
+S_new = exp(g_last) * S_old - C @ S_old + B
+```
+
+也可以写成：
+
+```text
+S_new = (exp(g_last) * I - C) @ S_old + B
+```
+
+实现时不要真的构造 `exp(g_last)*I-C`；直接：
+
+```text
+Z = C @ S_old
+S_new = exp(g_last) * S_old - Z + B
+```
+
+这样中间阶段只剩：
+
+```text
+1. 一个 state-dependent GEMM: C @ S_old
+2. 一次 state 的 scalar gate
+3. 一次减法和一次加法
+```
+
+原来的 output（`Q@S_old` 与 `ds@V_new`）完全移出这个 critical stage。
+
+## 18.2 output 延后后的精确形式
+
+output 仍然必须使用 `S_old`，不能误用已经更新的 `S_new`：
+
+```text
+O = scale * (exp(g) * Q @ S_old + ds @ V_new)
+```
+
+为了让 output 阶段也只做一个 GEMM，可在 state-independent 阶段预计算：
+
+```text
+P = exp(g) * Q - ds @ W       # [block_S, DK]
+R_o = ds @ U                  # [block_S, DV]
+```
+
+于是：
+
+```text
+O = scale * (P @ S_old + R_o)
+```
+
+完整 chunk 变成：
+
+```text
+Stage A: load + W/U + ds
+Stage B: 计算 state-independent 系数 C/B/P/R_o
+Stage C: 只算 S_new = exp(g_last)S_old - C@S_old + B
+Stage D: 只算 O = scale*(P@S_old + R_o)
+```
+
+注意：Stage D 必须保留 `S_old` 的副本；`S_new` 写回不能覆盖唯一的 `S_old`，否则 output 无法再算。
+
+## 18.3 比四个系数 GEMM 更好的融合
+
+`W` 与 `U` 有相同左操作数 `A`，先合并：
+
+```text
+WU = [W | U] = A @ [beta*exp(g)*K | beta*V]
+```
+
+对 `DV=64`，右侧宽度是 `DK+DV=192`；对 `DV=128`，宽度是 `256`。TileLang Hopper WGMMA 支持这些 N 值，但必须低级 AI 编译确认寄存器和真实指令。
+
+系数阶段不要分别算四个 GEMM。复用同一个 `[W|U]`：
+
+```text
+CB = (K^T @ R) @ [W | U]
+PR = ds @ [W | U]
+```
+
+拆分结果：
+
+```text
+CB[:, :DK] = C
+CB[:, DK:] = B
+PR[:, :DK] = ds@W
+PR[:, DK:] = R_o
+P = exp(g)*Q - PR[:, :DK]
+```
+
+因此推荐的高层 GEMM 数量是：
+
+```text
+1. WU       = A @ [beta*exp(g)*K | beta*V]
+2. ds       = Q @ K^T（再做 gate 和 causal mask）
+3. CB       = (K^T @ R) @ [W | U]
+4. PR       = ds @ [W | U]
+5. state    = C @ S_old
+6. output   = P @ S_old
+```
+
+原始主要路径约 7 次 GEMM；新路径约 6 次，且关键串行链的两个 state-dependent GEMM 被拆成各自独立的 `state` 与 `output` 阶段。若进一步让 `CB` 与 `PR` 做 M=192 的垂直堆叠，数学上可合成一个大 GEMM，但第一版不要赌 M=192 大 fragment；先用两个合法 M=128/M=64 GEMM验证。
+
+## 18.4 中间存储预算（必须按 lifetime coloring，不可把所有数组同时常驻）
+
+### 推荐先做 `DV=64` split 版本
+
+单个 CTA 负责一个 `[0:64]` 或 `[64:128]` 的 V slice：
+
+| buffer | shape | BF16 shared |
+|---|---:|---:|
+| Q | `[64,128]` | 16 KiB |
+| K | `[64,128]` | 16 KiB |
+| V | `[64,64]` | 8 KiB |
+| A | `[64,64]` | 8 KiB |
+| W/U 工作区 | `[64,128] + [64,64]` | 24 KiB |
+| ds | `[64,64]` | 8 KiB |
+| `S_old` | `[128,64]` | 16 KiB |
+| C/B 输出区 | `[128,128] + [128,64]` | 48 KiB |
+| P/R 输出区 | `[64,128] + [64,64]` | 24 KiB |
+| gate/local/对齐余量 | — | < 8 KiB |
+| **峰值（不做双版本）** | — | **约 176 KiB** |
+
+关键复用：
+
+```text
+W/U 工作区在 CB/PR 生成后释放；
+W/U 工作区可复用成 P/R 工作区；
+S_new 不必再开一份 BF16 shared，可先落到 FP32 fragment；
+```
+
+所以 `DV=64` 下数学中间存储是够的，低于 MIG 约 227 KiB 动态 shared 上限。真正不能做的是把 `C/B/P/R`、两份输入 ping-pong、两份 state 和 `W/U` 同时常驻。
+
+### `DV=128` 不建议作为第一版
+
+完整 V slice 会使 `S_old` 32 KiB、W/U 32 KiB、C/B 64 KiB、P/R 48 KiB 同时存在，叠加 Q/K/V/A 后接近或超过动态 shared 上限；而且 output/state fragment 寄存器峰值更危险。先用 DV=64 取得两倍 CTA 数，再考虑大 tile。
+
+### 全局 workspace 容量
+
+若 Stage A/B 与 Stage C/D 拆成不同 kernel，建议把系数按 BF16 写入 global workspace：
+
+```text
+C:  [B, chunks, Hv, 128,128] BF16 = 32 KiB / chunk / V-head
+B:  [B, chunks, Hv, 128,DV] BF16
+P:  [B, chunks, Hv,  64,128] BF16 = 16 KiB / chunk / V-head
+R_o:[B, chunks, Hv,  64,DV] BF16
+```
+
+`DV=128` 时合计 96 KiB / chunk / V-head：
+
+```text
+long_low       512*8*96 KiB  ≈ 384 MiB
+batch_split    128*32*96 KiB ≈ 384 MiB
+wide_gva_state 128*64*96 KiB ≈ 768 MiB
+deep_gva_state 256*32*96 KiB ≈ 768 MiB
+```
+
+这远小于 10 GiB；瓶颈不是显存容量，而是额外 global 写回/再读取和第二、第三次 kernel launch。
+
+## 18.5 关键正确性风险：实数等价不等于 BF16 逐步等价
+
+系数化改变了原始的结合顺序：
+
+```text
+原始：K^T @ (R * (U - W @ S_old))
+新式：K^T@R@U - (K^T@R@W) @ S_old
+```
+
+在实数运算中完全等价；在当前 BF16 输入、FP32 accumulate、若干 `T.copy` 截断下，不保证 bitwise 或误差完全相同。尤其 `S_new` 会跨 chunk 递推，不能像 output 近似那样任意放宽。
+
+低级 AI 必须先做 reference/torch 仿真：
+
+```text
+1. FP32 系数化：检查真实数学误差；
+2. 按当前 kernel 的 BF16 截断点仿真；
+3. 模拟 512 chunk long_low 的 state 误差是否仍 < rtol=5e-3, atol=5e-3；
+4. 只有 state 误差通过，才写 TileLang。
+```
+
+如果系数化 state 误差不通过，保留此结构用于 output-only：
+
+```text
+- Stage C 仍用原始 V_new 精确 state update；
+- Stage D 才用 P@S_old+R_o 的 output 近似/加速；
+```
+
+但这会失去“state-only 一个 GEMM”的最大收益，不应未经精度仿真直接实现。
+
+## 18.6 真正的四阶段执行方式
+
+不能把 `Stage A/B/C/D` 机械写成同一个 `T.Pipelined(num_stages=4)`；TileLang 的 `T.Pipelined` 主要重叠 global→shared copy 与 consumer，不会自动把四类 compute 分到四个执行阶段。
+
+要得到真实收益，优先级是：
+
+```text
+首选：Stage A/B 预计算 kernel（grid=chunks*B*Hv）
+    → Stage C state kernel（grid=DV_slices*B*Hv，chunk serial）
+    → Stage D output kernel（grid=chunks*DV_slices*B*Hv）
+```
+
+如果必须单 fused kernel，只有在手写 warp-specialization/async WGMMA 后才能把 A/B 与 C/D 真正重叠；当前 TileLang 4-WG 已有 barrier race，不作为第一实现。
+
+三 kernel 版本仍有 3 次 launch；但 Stage A/B 与 Stage D 的 grid 远大于 14 SM，Stage C 的 critical path 从原始约 2 个 state-dependent GEMM 降到 1 个，才是这条路线可能接近 110 的来源。
+
+## 18.7 低级 AI 只按这个顺序验证
+
+```text
+Experiment S0：torch/reference 仿真 state-only 公式，先看 8 case 精度
+Experiment S1：只做 WU 合并，确认 N=192/256 + workspace 写回
+Experiment S2：实现 CB（只 state coefficients），先不做 output coefficients
+Experiment S3：State kernel 只算 S_new，测 long_low critical path
+Experiment S4：加 PR 和 output kernel，确认 output 误差/总耗时
+Experiment S5：只有 S1-S4 都稳定后，才尝试 CB/PR 的 M=192 堆叠
+```
+
+禁止低级 AI 直接在默认 kernel 里把所有系数 buffer 同时塞进 shared；先做独立 workspace 版本，便于验证“state-only critical stage”是否真的带来收益。
+
+## 18.8 结论
+
+用户提出的拆法是正确的关键方向：中间阶段应只保留 state recurrence，output 放到后面；但必须同时满足两个条件：
+
+```text
+(1) S_old 必须在 output 阶段仍可读（不能提前覆盖）；
+(2) state-only 系数化的 BF16 误差必须经过长序列 state 仿真，否则误差会跨 chunk 累积。
+```
+
+如果 S0 通过，`CB/PR + DV=64 split + chunks/head 预计算` 是当前唯一同时具备：
+
+```text
+数学关键链缩短 + CTA 数增加 + output 不阻塞 state
+```
+
+的高潜力路线。
+
+---
+
+# 19. S0 仿真结果：state-only 系数化数值不稳定 (2026-08-21)
+
+## 19.1 Experiment S0 执行
+
+按 idea 18.7，用 torch 仿真 state-only 公式 `S_new = exp(g_last)·S_old - C@S_old + B`
+（`C = Kᵀ@R@W`, `B = Kᵀ@R@U`, `R = diag(exp(g_last - g_i))`），对比原始 `S_new = exp(g_last)·S_old + Kᵀ@(R@V_new)`。
+
+脚本 `lab3/s0_state_only_sim.py`（BF16 系数截断点对齐 matw：W/U/C/B 走 BF16 workspace，S_old 保 FP32）。
+
+## 19.2 结果：全 FAIL，state 误差远超 RTOL
+
+```text
+chain_equal       state_fp=2.41e+01 state_bf=2.41e+01(rel 5.00e+03) FAIL
+parallel_equal    state_fp=2.99e+01 state_bf=2.98e+01(rel 4.93e+03) FAIL
+parallel_gva      state_fp=6.79e+00 state_bf=6.79e+00(rel 1.64e+03) FAIL
+batch_split_gva   state_fp=2.99e+01 state_bf=2.99e+01(rel 7.38e+03) FAIL
+wide_gva_state    state_fp=4.90e+01 state_bf=4.90e+01(rel 8.69e+03) FAIL
+```
+
+**FP32 系数化也 FAIL**（state_fp ≈ state_bf），说明不是 BF16 截断问题，是数学结构本身数值不稳定。
+
+## 19.3 根因：catastrophic cancellation（`s0_trace.py` 定位）
+
+trace chain_equal chunk 4（S_old 已增长）：
+```text
+eg_last = 0.056
+|S_old| max       = 2.056e+01
+|eg_last·S_old|   = 1.144e+00   ← 正向 gate 项 (很小，因 eg_last 极小)
+|C@S_old|         = 1.019e+01   ← 系数减项
+|B|               = 1.252e+01   ← 系数加项
+|S_new_orig addend| (Kᵀ@R@V_new) = 1.430e+01  ← 原始直接加项
+|S_new|           = 1.394e+01   ← 结果
+```
+
+- `C@S_old (10.19)` + `B (12.52)` 与结果 `S_new (13.94)` 同量级，`eg_last·S_old (1.14)` 被淹没。
+- 原始形式 `eg_last·S_old (1.14) + Kᵀ@R@V_new (14.30) = 13.94`：两项都为正，无相消。
+- 系数形式 `eg_last·S_old (1.14) - C@S_old (10.19) + B (12.52) = 13.27`：减法 `1.14 - 10.19` 严重相消，再加 `B` 放大误差。
+- **chain_equal eg_last 极小 (0.026~0.056，强衰减 random_decay)**，`eg_last·S_old` 被压到极小，而 `C@S_old`/`B` 保持大值 → cancellation 主导。
+
+跨 chunk 递推：每个 chunk 的 cancellation 误差 `~1e-5`（FP32），但经 128 chunk 累积放大到 24（chain_equal）。state 误差跨 chunk 不可重置，故发散。
+
+## 19.4 结论：idea 18 state-only 系数化在 GDN 上不可行
+
+```text
+- 数学等价 (FP32 单步 diff 5.7e-6) 但数值不稳定 (跨 chunk 累积发散到 24)
+- 根因: 强衰减 case (eg_last 极小) 下 eg_last·S_old 被 C@S_old 淹没, catastrophic cancellation
+- BF16 加剧但非主因 (FP32 也 FAIL)
+- state 跨 chunk 递推, 误差不可重置 → 必须用原始 V_new 直接形式 (无系数化)
+```
+
+**idea 18.5 的风险预判正确**："实数等价不等于 BF16 逐步等价"——实际上 FP32 就已不稳定。
+**idea 18.8 的 fallback 成立**：保留 Stage C 原始 V_new 精确 state update，Stage D 用 output 近似。
+
+但 state-only critical stage 的最大收益（消掉 W@S_old→V_new→Kᵀ@V_new 串行链）不成立，
+因为 state update 必须保持 `Kᵀ@(R@(U - W@S_old))` 原始形式。
+
+## 19.5 剩余可走的方向
+
+idea 17.3 的 SP-DV2（State-independent Precompute + DV split）不依赖系数化，
+W/ds 预计算 + DV=64 split 增加 CTA 是独立路线，state update 仍用原始 V_new 形式。
+这是当前唯一未证伪的高潜力路线，下一步应实现 SP-DV2 Experiment 1/2。
+
+---
+
+# 20. SP-DV2 实现 + S0 仿真记录 (2026-08-21)
+
+## 20.1 S0 state-only 仿真 (idea 18.7) — 证伪
+
+```text
+commit: (uncommitted, s0_state_only_sim.py 已删, 结果见 idea 19)
+env switch: 无 (torch 仿真)
+结论: state-only 系数化数值不稳定, 全 case FAIL (state_fp ≈ state_bf ≈ 24, rel 5000x)
+根因: catastrophic cancellation. eg_last 极小 (0.026) 时 eg_last·S_old(1.14) 被 C@S_old(10.19) 淹没,
+      FP32 单步 diff 5.7e-6 但跨 128 chunk 累积发散到 24. state 跨 chunk 不可重置.
+★ idea 18.5 风险预判正确; idea 18.8 fallback (保留原始 V_new state) 是唯一可行路径.
+```
+
+## 20.2 SP-DV2 实现 (idea 17.3, 原始 V_new state, 不系数化) — 精确但性能退步
+
+```text
+commit: (uncommitted, _gdn_spdv2_pre_kernel + _gdn_spdv2_main_kernel)
+env switch: GDN_SPDV2=1
+结构:
+  Kernel A: 预计算 W = A@(βγK), grid=chunks*B*Hv, 写 global BF16 workspace [B,Hv,num_chunks,64,128]
+  Kernel B: DV=64 split 主 kernel, grid=2*B*Hv, 读 W workspace, state 用原始 V_new = U - W@S_old, S_new = γr·S_old + Kᵀ@(R@V_new)
+  full-tile T.copy load (无尾块, 仅 T%64==0)
+precision (7 可测 case): 全 PASS (short_tail T%64≠0 走默认 matw)
+t100 vs matw 基线:
+  chain_equal:    0.618ms (vs 0.524, +18%)
+  long_low_gva:   4.588ms (vs 3.003, +53%)
+  wide_gva_state: 6.673ms (vs 3.77, +77%)
+  deep_gva_state: 6.683ms (vs 4.46, +50%)
+  batch_split:    3.163ms (vs 2.26, +40%)
+  parallel_equal: 0.474ms (vs 0.45, +5%)
+  parallel_gva:   0.478ms (vs 0.43, +11%)
+threads/block_DV/num_stages: Kernel A th=256; Kernel B th=128, DV=64, st=2
+是否比 matw 快: 否. 全线退步, 长序列 +40~77%.
+失败原因 (与 decomp K1/K2/K3 + DV=64 调参同根因):
+  (1) W global workspace round-trip: Kernel A 写 W (16KB/chunk/head), Kernel B 读回.
+      long_low 512 chunk * 8 head = 4096 chunk → 64MB 额外 global 读写, 无 L2 命中 (首次写/读).
+      原始 matw W 在 fragment/shared 算完即用, 无 global 往返. 物化开销 >> 省 1 GEMM 收益.
+  (2) DV=64 TC 效率损失: memory v5 已证 DV=64 比 DV=128 慢 1.5-2x (大 grid).
+      CTA 翻倍 (8→16) 的占用收益被 per-CTA TC 效率降抵消还倒贴.
+  (3) 2 kernel launch + JIT: Kernel A/B 各编译一次.
+  (4) W 只占 1/7 GEMM (14%), 不是 idea 估计的 25%: 省 W 的收益太小.
+结论: ★ SP-DV2 精确但性能退步. 与 decomp (慢 1.1-1.9x) + DV=64 调参 (慢 1.5x) 同类失败:
+  global 物化 W 往返 + DV=64 TC 降级 >> W 去重 + CTA 翻倍收益.
+  ★ idea 17.2 A (低 occupancy 是瓶颈) 判断正确, 但 17.3 (DV split 解决) 失败:
+    DV=64 本身是 TC 效率瓶颈, 不是 CTA 数量. 翻倍 CTA 无法补偿 DV 降级.
+```
+
+## 20.3 下一步: Experiment 1 (full-tile T.copy matw, idea 17.5)
+
+SP-DV2 Kernel B 已用 full-tile T.copy load, 但 DV=64 掩盖了 T.copy 的收益.
+需单独验证: DV=128 + T.copy (无尾块) 的 matw, 隔离 load pipeline 收益 (无 DV 降级混淆).
+
+## 20.4 Experiment 1: full-tile T.copy matw (idea 17.5) — 证伪
+
+```text
+commit: (uncommitted, _gdn_naive_kernel_matw_fulltile)
+env switch: GDN_FULLTILE=1
+结构: matw 数学不变, DV=128/th=256/st=2 (同长序列基线), 仅把 6 个 load 从 T.Parallel ew 改 T.copy 全片
+  (无边界判断, T%64==0). 进 T.Pipelined producer pipeline (ClassifyCopyLikeStage 认 CopyNode).
+precision: 全 PASS (chain 0.615, long_low 4.679)
+t100 vs matw 基线:
+  chain_equal:  0.615ms (vs 0.524, +17%)
+  long_low:     4.679ms (vs 3.003, +56%)
+是否比 matw 快: 否. 全线退步.
+失败原因:
+  ★ T.copy 对 g_cumsum/beta (1D [64] FP32) fallback 到 normal copy (非 TMA bulk):
+    "src range must have last dim multiple of 16 for tma bulk load g_cumsum range 1*4 % 16 != 0"
+    (memory TMA 实验同警告). g/beta 仍 element-wise, 但 Q/K/V/A 走 TMA.
+  ★ 即便 Q/K/V/A 走 TMA, 仍退步 +56% — 说明 load pipeline 不是瓶颈:
+    H800 MIG 14 SM, long_low grid=8 (DV=128), 每 CTA 512 chunk 串行.
+    load 本身占时小 (L2 命中高), GEMM/ew 串行主导. T.copy producer pipeline 重叠的 load
+    不是关键路径, 重叠收益 < T.copy 调度开销.
+  ★ 与 TMA 实验 (memory 6 节, +23%) 一致: T.copy/TMA load 在 GDN 长 chunk 串行下无收益.
+结论: ★ idea 17.2 C (load 没进 producer pipeline 是瓶颈) 判断不成立.
+  load pipeline 重叠不是 long_low 退步主因, GEMM 串行 critical path 才是.
+  full-tile T.copy 反而退步 (调度开销 > 重叠收益).
+```
+
+## 20.5 本轮总结 (S0 + SP-DV2 + full-tile 三路证伪)
+
+```text
+idea 18 (state-only 系数化): 数值不稳定 (cancellation), 证伪
+idea 17.3 (SP-DV2 W 预计算 + DV split): 精确但 global 往返 + DV=64 降级退步, 证伪
+idea 17.5 (full-tile T.copy pipeline): 精确但 load 非瓶颈退步, 证伪
+★ idea 17.2 三瓶颈重判:
+  A (低 occupancy): 真, 但 DV split 解法失败 (DV=64 TC 降级 > CTA 翻倍)
+  B (state critical path 长): 真, 但无解 (state 必须串行, 系数化数值不稳)
+  C (load 没进 pipeline): 假, full-tile T.copy 反而退步
+★ 剩余未证伪的 idea 路线:
+  17.4 (输出水平拼接 [Qhat|ds]@S_old/V_new, M=64 K=192): 5-12% 级, 非主路线
+  4 (A 下三角分块): 攻击 A@K/A@V 两 GEMM, 未验证
+  6 (GVA head fusion): G=4 共享 Q/K, 未验证
+★ 当前 93 分基线 (matw DV=128) 可能已是 MIG + tilelang 的实际性能上限.
+  110 分需 ~1.6x, 所有已验证路线 (WY-O/async/堆叠/SP-DV2/TMA/full-tile) 均无法兑现.
+  建议: 转向实验报告 (三轮 4-WG + WY-O 数学 + 堆叠 + SP-DV2 + state-only 证伪过程),
+  作为报告主要评分依据.
+```
+
+
