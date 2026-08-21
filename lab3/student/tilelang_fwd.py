@@ -1169,6 +1169,246 @@ def _gdn_spdv2_main_kernel(B, S, Hq, Hv, DK, DV, num_chunks, block_DV=64, thread
 
 
 # ============================================================
+# State-only 三 kernel (idea 18.6, S1/S2/S3/S4 实现)
+#   数学 (S0 已验证 FP64 等价, FP32 ~1e-7; S1b BF16 workspace + C 保 FP32 全 PASS):
+#     W=A@(βγK), U=A@(βV), ds=tril(QKᵀ)⊙(γ_i/γ_j)
+#     C=Kᵀ@(R@W), B=Kᵀ@(R@U), R=diag(exp(g_last-g_i))    [state 系数]
+#     P=γ⊙Q-ds@W, R_o=ds@U                               [output 系数]
+#     Kernel A: 算 W/U/ds → C/B/P/R, 写 global workspace (grid=chunks*B*Hv, 完全并行)
+#     Kernel B: S[c]=γr·S[c-1]-C@S[c-1]+B, 写 S_all[c+1] (grid=DV_slices*B*Hv, chunk 串行, 1 GEMM)
+#     Kernel C: O[c]=scale·(P@S[c-1]+R_o), 读 S_all[c] (grid=chunks*DV_slices*B*Hv, 完全并行)
+#   ★ 用户修正: S_new 写 S_all[c+1] (新位置), S_all[c] 留给 output kernel → state/output 时序解耦.
+#   ★ C 保 FP32 workspace (BF16 C 会导致 state ~5e-3 超 RTOL; FP32 C 全 PASS ~2e-3).
+#     W/U/ds/P/R_o 保 BF16 (与 matw 截断点一致, output 误差不跨 chunk 累积).
+# ============================================================
+@tilelang.jit(out_idx=[-4, -3, -2, -1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_so_pre_kernel(B, S, Hq, Hv, DK, DV, num_chunks, threads=256):
+    """State-only Kernel A: 算 C/B/P/R 写 global workspace. state-independent, grid=chunks*B*Hv."""
+    block_S = CHUNK_SIZE
+    G = Hv // Hq
+    QK_shape = (B, S, Hq, DK)
+    V_shape = (B, S, Hv, DV)
+    gate_shape = (B, S, Hv)
+    A_shape = (B, S, Hv, block_S)
+    C_shape = (B, Hv, num_chunks, DK, DK)
+    Bc_shape = (B, Hv, num_chunks, DK, DV)
+    P_shape = (B, Hv, num_chunks, block_S, DK)
+    Ro_shape = (B, Hv, num_chunks, block_S, DV)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(QK_shape, dtype=T.bfloat16),
+        K: T.Tensor(QK_shape, dtype=T.bfloat16),
+        V: T.Tensor(V_shape, dtype=T.bfloat16),
+        g_cumsum: T.Tensor(gate_shape, dtype=T.float32),
+        beta: T.Tensor(gate_shape, dtype=T.float32),
+        A: T.Tensor(A_shape, dtype=T.bfloat16),
+        C_out: T.Tensor(C_shape, dtype=T.float32),
+        Bc_out: T.Tensor(Bc_shape, dtype=T.bfloat16),
+        P_out: T.Tensor(P_shape, dtype=T.bfloat16),
+        Ro_out: T.Tensor(Ro_shape, dtype=T.bfloat16),
+    ):
+        with T.Kernel(num_chunks, B * Hv, threads=threads) as (ci, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+            bhg = bh // G
+            left = ci * block_S
+
+            Q_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            K_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            V_shared = T.alloc_shared((block_S, DV), dtype=T.bfloat16)
+            A_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+            bkg_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            bv_shared = T.alloc_shared((block_S, DV), dtype=T.bfloat16)
+            ds_shared = T.alloc_shared((block_S, block_S), dtype=T.bfloat16)
+
+            g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_exp_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_inv_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            beta_g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_last_shared = T.alloc_shared((1,), dtype=T.float32)
+            R_shared = T.alloc_shared((block_S,), dtype=T.float32)
+
+            W_frag = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            U_frag = T.alloc_fragment((block_S, DV), dtype=T.float32)
+            ds_tmp = T.alloc_fragment((block_S, block_S), dtype=T.float32)
+            RW_frag = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            RU_frag = T.alloc_fragment((block_S, DV), dtype=T.float32)
+            C_frag = T.alloc_fragment((DK, DK), dtype=T.float32)
+            B_frag = T.alloc_fragment((DK, DV), dtype=T.float32)
+            dsW_frag = T.alloc_fragment((block_S, DK), dtype=T.float32)
+            dsU_frag = T.alloc_fragment((block_S, DV), dtype=T.float32)
+            P_frag = T.alloc_fragment((block_S, DK), dtype=T.float32)
+
+            T.copy(Q[bb, left:left + block_S, bhg, 0:DK], Q_shared)
+            T.copy(K[bb, left:left + block_S, bhg, 0:DK], K_shared)
+            T.copy(V[bb, left:left + block_S, bh, 0:DV], V_shared)
+            T.copy(A[bb, left:left + block_S, bh, 0:block_S], A_shared)
+            T.copy(g_cumsum[bb, left:left + block_S, bh], g_shared)
+            T.copy(beta[bb, left:left + block_S, bh], beta_shared)
+
+            for t in T.Parallel(block_S):
+                g_exp_shared[t] = T.exp2(g_shared[t] * LOG2E)
+                g_inv_shared[t] = T.exp2(-g_shared[t] * LOG2E)
+                beta_g_shared[t] = beta_shared[t] * g_exp_shared[t]
+            g_last_shared[0] = g_shared[block_S - 1]
+            for t in T.Parallel(block_S):
+                R_shared[t] = T.exp2((g_last_shared[0] - g_shared[t]) * LOG2E)
+
+            # βγK, W = A@βγK
+            for t, d in T.Parallel(block_S, DK):
+                bkg_shared[t, d] = T.cast(
+                    T.cast(K_shared[t, d], T.float32) * beta_g_shared[t], T.bfloat16)
+            T.gemm(A_shared, bkg_shared, W_frag, clear_accum=True)
+            T.copy(W_frag, bkg_shared)  # bkg_shared = W (BF16)
+            # βV, U = A@βV
+            for t, d in T.Parallel(block_S, DV):
+                bv_shared[t, d] = T.cast(
+                    T.cast(V_shared[t, d], T.float32) * beta_shared[t], T.bfloat16)
+            T.gemm(A_shared, bv_shared, U_frag, clear_accum=True)
+            T.copy(U_frag, bv_shared)  # bv_shared = U (BF16)
+
+            # ds = tril(Q@Kᵀ) ⊙ (γ_i/γ_j)
+            T.gemm(Q_shared, K_shared, ds_tmp, transpose_B=True, clear_accum=True)
+            for i, j in T.Parallel(block_S, block_S):
+                if i >= j:
+                    ds_tmp[i, j] = ds_tmp[i, j] * g_exp_shared[i] * g_inv_shared[j]
+                else:
+                    ds_tmp[i, j] = 0
+            T.copy(ds_tmp, ds_shared)
+
+            # ★ Reorder: (1) ds@W → P, (2) ds@U → R_o, (3) W*=R → C, (4) U*=R → B
+            # (1) P = γ⊙Q - ds@W (uses raw W in bkg_shared)
+            T.gemm(ds_shared, bkg_shared, dsW_frag, clear_accum=True)  # ds@W
+            for t, d in T.Parallel(block_S, DK):
+                P_frag[t, d] = T.cast(Q_shared[t, d], T.float32) * g_exp_shared[t] - dsW_frag[t, d]
+            T.copy(P_frag, P_out[bb, bh, ci, 0:block_S, 0:DK])  # P BF16
+            # (2) R_o = ds@U (uses raw U in bv_shared)
+            T.gemm(ds_shared, bv_shared, dsU_frag, clear_accum=True)
+            T.copy(dsU_frag, Ro_out[bb, bh, ci, 0:block_S, 0:DV])  # R_o BF16
+            # (3) C = Kᵀ@(R⊙W): overwrite bkg_shared with R⊙W (W no longer needed raw)
+            for t, d in T.Parallel(block_S, DK):
+                bkg_shared[t, d] = T.cast(
+                    T.cast(bkg_shared[t, d], T.float32) * R_shared[t], T.bfloat16)
+            T.gemm(K_shared, bkg_shared, C_frag, transpose_A=True, clear_accum=True)
+            T.copy(C_frag, C_out[bb, bh, ci, 0:DK, 0:DK])  # C FP32
+            # (4) B = Kᵀ@(R⊙U): overwrite bv_shared with R⊙U
+            for t, d in T.Parallel(block_S, DV):
+                bv_shared[t, d] = T.cast(
+                    T.cast(bv_shared[t, d], T.float32) * R_shared[t], T.bfloat16)
+            T.gemm(K_shared, bv_shared, B_frag, transpose_A=True, clear_accum=True)
+            T.copy(B_frag, Bc_out[bb, bh, ci, 0:DK, 0:DV])  # B BF16
+
+    return kernel
+
+
+# Kernel B: state recurrence, chunk serial, DV split.
+#   S[c] = γr·S[c-1] - C@S[c-1] + B, 写 S_all[c+1]. C FP32 workspace, B BF16, S_old FP32 fragment.
+#   ★ C@S_old: C is FP32 shared, S_old FP32 fragment → T.gemm needs same dtype. Store C as BF16 in a
+#   separate shared for the GEMM, but ALSO keep FP32 C for accumulation? No — T.gemm(C_bf16_shared, S_old_bf16_shared)
+#   gives FP32 accum CS_frag. S1b showed BF16 C + BF16 S_old snap → state ~2e-3 (PASS, C FP32 only marginally better).
+#   Use BF16 C for the GEMM operand (C FP32 workspace → cast to BF16 shared), S_old BF16 snapshot.
+@tilelang.jit(out_idx=[-1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_so_state_kernel(B, S, Hq, Hv, DK, DV, num_chunks, block_DV=128, threads=256):
+    """State-only Kernel B: chunk serial. S[c]=γr·S[c-1]-C@S[c-1]+B → S_all[c+1]."""
+    block_S = CHUNK_SIZE
+    C_shape = (B, Hv, num_chunks, DK, DK)
+    Bc_shape = (B, Hv, num_chunks, DK, DV)
+    gate_shape = (B, S, Hv)
+    init_shape = (B, Hv, DK, DV)
+    Sall_shape = (B, Hv, num_chunks + 1, DK, DV)
+
+    @T.prim_func
+    def kernel(
+        g_cumsum: T.Tensor(gate_shape, dtype=T.float32),
+        C_in: T.Tensor(C_shape, dtype=T.float32),
+        Bc_in: T.Tensor(Bc_shape, dtype=T.bfloat16),
+        initial_state: T.Tensor(init_shape, dtype=T.float32),
+        S_all: T.Tensor(Sall_shape, dtype=T.float32),
+    ):
+        with T.Kernel(T.ceildiv(DV, block_DV), B * Hv, threads=threads) as (bv, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+
+            s_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            s_fragment = T.alloc_fragment((DK, block_DV), dtype=T.float32)
+            C_bf16 = T.alloc_shared((DK, DK), dtype=T.bfloat16)
+            B_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            CS_frag = T.alloc_fragment((DK, block_DV), dtype=T.float32)
+            g_shared = T.alloc_shared((block_S,), dtype=T.float32)
+            g_last_local = T.alloc_local((1,), T.float32)
+            gl_local = T.alloc_local((1,), T.float32)
+
+            T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
+            T.copy(s_shared, s_fragment)
+            T.copy(s_fragment, S_all[bb, bh, 0, 0:DK, bv * block_DV : (bv + 1) * block_DV])
+
+            for ci in T.serial(num_chunks):
+                left = ci * block_S
+                # g_last for this chunk
+                g_last_local[0] = g_cumsum[bb, left + block_S - 1, bh]
+                gl_local[0] = T.exp2(g_last_local[0] * LOG2E)
+                # C (FP32 ws) → BF16 shared for GEMM
+                for i, j in T.Parallel(DK, DK):
+                    C_bf16[i, j] = T.cast(C_in[bb, bh, ci, i, j], T.bfloat16)
+                # B slice → B_shared (BF16, direct copy)
+                T.copy(Bc_in[bb, bh, ci, 0:DK, bv * block_DV : (bv + 1) * block_DV], B_shared)
+                # S_old snapshot → s_shared (BF16)
+                T.copy(s_fragment, s_shared)
+                # CS = C @ S_old (BF16 × BF16 → FP32)
+                T.gemm(C_bf16, s_shared, CS_frag, clear_accum=True)
+                # S_new = γr·S_old - CS + B
+                for t, d in T.Parallel(DK, block_DV):
+                    s_fragment[t, d] = gl_local[0] * s_fragment[t, d] - CS_frag[t, d] + T.cast(B_shared[t, d], T.float32)
+                # write S_all[c+1]
+                T.copy(s_fragment, S_all[bb, bh, ci + 1, 0:DK, bv * block_DV : (bv + 1) * block_DV])
+
+    return kernel
+
+
+# Kernel C: output, fully parallel over chunks. O[c]=scale·(P@S[c-1]+R_o), reads S_all[c].
+@tilelang.jit(out_idx=[-1], pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def _gdn_so_out_kernel(B, S, Hq, Hv, DK, DV, num_chunks, block_DV=128, threads=256):
+    """State-only Kernel C: output. O[c]=scale·(P@S[c-1]+R_o). grid=chunks*ceildiv(DV/block_DV)*B*Hv."""
+    block_S = CHUNK_SIZE
+    P_shape = (B, Hv, num_chunks, block_S, DK)
+    Ro_shape = (B, Hv, num_chunks, block_S, DV)
+    Sall_shape = (B, Hv, num_chunks + 1, DK, DV)
+    O_shape = (B, S, Hv, DV)
+
+    @T.prim_func
+    def kernel(
+        P_in: T.Tensor(P_shape, dtype=T.bfloat16),
+        Ro_in: T.Tensor(Ro_shape, dtype=T.bfloat16),
+        S_all: T.Tensor(Sall_shape, dtype=T.float32),
+        O: T.Tensor(O_shape, dtype=T.bfloat16),
+    ):
+        with T.Kernel(num_chunks, T.ceildiv(DV, block_DV), B * Hv, threads=threads) as (ci, bv, bbh):
+            bb, bh = bbh // Hv, bbh % Hv
+            left = ci * block_S
+
+            P_shared = T.alloc_shared((block_S, DK), dtype=T.bfloat16)
+            Ro_shared = T.alloc_shared((block_S, block_DV), dtype=T.bfloat16)
+            s_shared = T.alloc_shared((DK, block_DV), dtype=T.bfloat16)
+            O_frag = T.alloc_fragment((block_S, block_DV), dtype=T.float32)
+
+            T.copy(P_in[bb, bh, ci, 0:block_S, 0:DK], P_shared)
+            T.copy(Ro_in[bb, bh, ci, 0:block_S, bv * block_DV : (bv + 1) * block_DV], Ro_shared)
+            # S_all[c] (FP32) → s_shared (BF16 snapshot)
+            T.copy(S_all[bb, bh, ci, 0:DK, bv * block_DV : (bv + 1) * block_DV], s_shared)
+            # O = P @ S_old + R_o
+            T.gemm(P_shared, s_shared, O_frag, clear_accum=True)
+            for t, d in T.Parallel(block_S, block_DV):
+                O_frag[t, d] = O_frag[t, d] + T.cast(Ro_shared[t, d], T.float32)
+            # write O * scale
+            for t, d in T.Parallel(block_S, block_DV):
+                O[bb, left + t, bh, bv * block_DV + d] = T.cast(
+                    (DK ** -0.5) * O_frag[t, d], T.bfloat16)
+
+    return kernel
+
+
+
+# ============================================================
 # Qhat/Khat 换元版 (长序列, 精确零近似) — ★ 已验证性能退步, 保留供报告引用
 #   实测 (GDN_QHAT=1, 集群): chain_equal 0.729ms (vs matw 0.53, +37%)
 #                            long_low_gva 3.499ms (vs matw 3.04, +15%)
@@ -3084,6 +3324,7 @@ def gdn_prefill_forward(
     _STACKWU = os.environ.get("GDN_STACKWU", "0") == "1"
     _SPDV2 = os.environ.get("GDN_SPDV2", "0") == "1"
     _FULLTILE = os.environ.get("GDN_FULLTILE", "0") == "1"
+    _SO = os.environ.get("GDN_SO", "0") == "1"
     if _WS4_FQLA and (num_tokens % CHUNK_SIZE == 0):
         # ★ 4-WG 照搬 FlashQLA hopper (第五轮): 4 sub-warp producer + set_max_nreg +
         #   T.tma_copy(barrier=) 自动 arrive + 13 barrier 结构. 数学 = FlashQLA (W=V-g⊙U).
@@ -3290,6 +3531,26 @@ def gdn_prefill_forward(
                 head_dim_k, head_dim_v,
                 block_DV=128, threads=256, num_stages=2,
             )
+    elif _SO and (num_tokens % CHUNK_SIZE == 0) and num_tokens > 2048:
+        # ★ State-only 三 kernel (idea 18.6 + 用户修正 S_new 写新位置解耦 output):
+        #   Kernel A: C/B/P/R 预计算 (grid=chunks*B*Hv, 并行)
+        #   Kernel B: S[c]=γr·S[c-1]-C@S[c-1]+B (grid=DV_slices*B*Hv, chunk 串行, 1 GEMM, 写 S_all[c+1])
+        #   Kernel C: O[c]=scale·(P@S[c-1]+R_o) (grid=chunks*DV_slices*B*Hv, 完全并行, 读 S_all[c])
+        #   尾块 case 走默认 matw. 仅 T%64==0 长序列.
+        num_chunks = num_tokens // CHUNK_SIZE
+        _bdv = 128 if (batch_size * num_heads_v) > 4 else 64
+        _th = 256 if (batch_size * num_heads_v) > 4 else 128
+        pre_k = _gdn_so_pre_kernel(batch_size, num_tokens, num_heads_qk, num_heads_v,
+                                   head_dim_k, head_dim_v, num_chunks, threads=256)
+        st_k = _gdn_so_state_kernel(batch_size, num_tokens, num_heads_qk, num_heads_v,
+                                    head_dim_k, head_dim_v, num_chunks, block_DV=_bdv, threads=_th)
+        out_k = _gdn_so_out_kernel(batch_size, num_tokens, num_heads_qk, num_heads_v,
+                                   head_dim_k, head_dim_v, num_chunks, block_DV=_bdv, threads=_th)
+        C_out, Bc_out, P_out, Ro_out = pre_k(q, k, v, g_cumsum, beta, A)
+        S_all = st_k(g_cumsum, C_out, Bc_out, initial_state)
+        output = out_k(P_out, Ro_out, S_all)
+        final_state = S_all[:, :, num_chunks, :, :].contiguous()
+        return output, final_state
     elif num_tokens <= 2048:
         kernel = _gdn_naive_kernel(
             batch_size, num_tokens, num_heads_qk, num_heads_v,

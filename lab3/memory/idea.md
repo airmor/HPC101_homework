@@ -1610,33 +1610,52 @@ Experiment S5：只有 S1-S4 都稳定后，才尝试 CB/PR 的 M=192 堆叠
 
 ---
 
-# 19. S0 仿真结果：state-only 系数化数值不稳定 (2026-08-21)
+# 19. S0 仿真结果 — ★ 已修正 (2026-08-21)
 
-## 19.1 Experiment S0 执行
+## 19.1 原始 S0 结论 (错误)
 
-按 idea 18.7，用 torch 仿真 state-only 公式 `S_new = exp(g_last)·S_old - C@S_old + B`
-（`C = Kᵀ@R@W`, `B = Kᵀ@R@U`, `R = diag(exp(g_last - g_i))`），对比原始 `S_new = exp(g_last)·S_old + Kᵀ@(R@V_new)`。
+原 S0 (`s0_state_only_sim.py`) 报全 case FAIL (state ~24, rel 5000x)，归因 catastrophic cancellation。
+idea 19.2/19.3 的具体数字和 trace 均基于此。
 
-脚本 `lab3/s0_state_only_sim.py`（BF16 系数截断点对齐 matw：W/U/C/B 走 BF16 workspace，S_old 保 FP32）。
+## 19.2 bug 定位
 
-## 19.2 结果：全 FAIL，state 误差远超 RTOL
+**S0 仿真有 bug**：`R = exp(eg_last - gh)` 误用 `eg_last = exp(gh[-1])`（标量 S_old gate），
+应为 `R = exp(g_last - gh)`，`g_last = gh[-1]`（raw 未 exp）。
+- matw kernel 正确：`gl_local = exp2(g_last*LOG2E)`（标量 gate on S_old），
+  state 用 `gl_local * g_inv_shared[t] = exp(g_last - g[t])`（正确 R）。
+- 我的独立仿真把两者搞混，导致 R 大 ~38x（chain eg_last=0.026 当 g_last，真实 g_last=-3.64）。
+
+## 19.3 修正后 S0 结果 (`s0_final2.py`)
 
 ```text
-chain_equal       state_fp=2.41e+01 state_bf=2.41e+01(rel 5.00e+03) FAIL
-parallel_equal    state_fp=2.99e+01 state_bf=2.98e+01(rel 4.93e+03) FAIL
-parallel_gva      state_fp=6.79e+00 state_bf=6.79e+00(rel 1.64e+03) FAIL
-batch_split_gva   state_fp=2.99e+01 state_bf=2.99e+01(rel 7.38e+03) FAIL
-wide_gva_state    state_fp=4.90e+01 state_bf=4.90e+01(rel 8.69e+03) FAIL
+chain_equal       FP64 orig-coeff=0  coeff-ref=0       | FP32 coeff-ref=1.5e-7  PASS
+parallel_equal    FP64 orig-coeff=0                    | 1.2e-7  PASS
+parallel_gva      FP64 orig-coeff=0                    | 2.4e-7  PASS
+batch_split_gva   B=4                                  | 1.8e-7  PASS
+wide_gva_state                                         | 1.8e-7  PASS
 ```
 
-**FP32 系数化也 FAIL**（state_fp ≈ state_bf），说明不是 BF16 截断问题，是数学结构本身数值不稳定。
+**FP64 完全等价 (diff=0)**，**FP32 coeff-vs-ref ~1e-7** (BF16 输入噪声级)，**全 PASS**。
 
-## 19.3 根因：catastrophic cancellation（`s0_trace.py` 定位）
+## 19.4 结论修正
 
-trace chain_equal chunk 4（S_old 已增长）：
+idea 18 state-only 系数化数学**完全可行**，无 catastrophic cancellation。
+原 "证伪" 是仿真 bug，非数学问题。matw kernel 一直正确。
+
+★ idea 18.8 条件 (2) "BF16 误差必须仿真" 现已通过 → 可进入 S1-S4 实现。
+★ idea 18.8 条件 (1) "S_old 不能提前覆盖" 经用户指出：S_new 写新位置 S_all[c+1]，
+  S_all[c] 留给 output kernel 读 → 时序解耦, state/output 并行无冲突.
+  state kernel critical path 缩到 1 GEMM (C@S_old), output kernel grid=chunks*DV_slices*B*Hv 完全并行.
+
+## 19.5 下一波实现 (idea 18.6 三 kernel 结构)
+
 ```text
-eg_last = 0.056
-|S_old| max       = 2.056e+01
+Kernel A (precompute): W/U/ds → C/B/P/R  grid=chunks*B*Hv   完全并行, state-independent
+Kernel B (state):      S[c]=γr·S[c-1]-C@S[c-1]+B  grid=DV_slices*B*Hv  chunk 串行, 1 GEMM
+Kernel C (output):     O[c]=scale·(P@S[c-1]+R)  grid=chunks*DV_slices*B*Hv  完全并行
+S_all[B,Hv,num_chunks+1,DK,DV] FP32: state 序列, Kernel B 写 S_all[c+1], Kernel C 读 S_all[c]
+```
+
 |eg_last·S_old|   = 1.144e+00   ← 正向 gate 项 (很小，因 eg_last 极小)
 |C@S_old|         = 1.019e+01   ← 系数减项
 |B|               = 1.252e+01   ← 系数加项
@@ -1676,15 +1695,20 @@ W/ds 预计算 + DV=64 split 增加 CTA 是独立路线，state update 仍用原
 
 # 20. SP-DV2 实现 + S0 仿真记录 (2026-08-21)
 
-## 20.1 S0 state-only 仿真 (idea 18.7) — 证伪
+## 20.1 S0 state-only 仿真 (idea 18.7) — ★ 已修正 (原结论错误)
 
 ```text
-commit: (uncommitted, s0_state_only_sim.py 已删, 结果见 idea 19)
+commit: (uncommitted, s0 脚本已删)
 env switch: 无 (torch 仿真)
-结论: state-only 系数化数值不稳定, 全 case FAIL (state_fp ≈ state_bf ≈ 24, rel 5000x)
-根因: catastrophic cancellation. eg_last 极小 (0.026) 时 eg_last·S_old(1.14) 被 C@S_old(10.19) 淹没,
-      FP32 单步 diff 5.7e-6 但跨 128 chunk 累积发散到 24. state 跨 chunk 不可重置.
-★ idea 18.5 风险预判正确; idea 18.8 fallback (保留原始 V_new state) 是唯一可行路径.
+原结论 (错误): state-only 系数化数值不稳定, 全 FAIL (state~24)
+  根因误判: catastrophic cancellation (eg_last 极小被 C@S_old 淹没)
+bug 定位: 仿真 R = exp(eg_last - gh) 误用 eg_last=exp(gh[-1]) (标量 gate),
+  应为 R = exp(g_last - gh), g_last=gh[-1] (raw). R 大 ~38x 导致 state 发散.
+修正后 (s0_final2.py):
+  FP64 orig-coeff diff = 0 (完全等价)
+  FP32 coeff-vs-ref ~1e-7 (BF16 噪声级), 全 PASS
+  (chain 1.5e-7, parallel 1.2e-7, parallel_gva 2.4e-7, batch_split 1.8e-7, wide 1.8e-7)
+★ idea 18 state-only 系数化数学完全可行, 无 cancellation. idea 18.5 风险预判被仿真 bug 误导.
 ```
 
 ## 20.2 SP-DV2 实现 (idea 17.3, 原始 V_new state, 不系数化) — 精确但性能退步
@@ -1752,24 +1776,23 @@ t100 vs matw 基线:
   full-tile T.copy 反而退步 (调度开销 > 重叠收益).
 ```
 
-## 20.5 本轮总结 (S0 + SP-DV2 + full-tile 三路证伪)
+## 20.5 本轮总结 (S0 修正 + SP-DV2 + full-tile)
 
 ```text
-idea 18 (state-only 系数化): 数值不稳定 (cancellation), 证伪
-idea 17.3 (SP-DV2 W 预计算 + DV split): 精确但 global 往返 + DV=64 降级退步, 证伪
-idea 17.5 (full-tile T.copy pipeline): 精确但 load 非瓶颈退步, 证伪
+★ idea 18 (state-only 系数化): S0 bug 修正后完全可行 (FP64 等价, FP32 ~1e-7). 进入实现.
+idea 17.3 (SP-DV2 W 预计算 + DV split, 原始 V_new): 精确但 DV=64 降级退步, 证伪 (W 预计算 + DV split 这条).
+idea 17.5 (full-tile T.copy pipeline): 精确但 load 非瓶颈退步, 证伪.
 ★ idea 17.2 三瓶颈重判:
-  A (低 occupancy): 真, 但 DV split 解法失败 (DV=64 TC 降级 > CTA 翻倍)
-  B (state critical path 长): 真, 但无解 (state 必须串行, 系数化数值不稳)
-  C (load 没进 pipeline): 假, full-tile T.copy 反而退步
-★ 剩余未证伪的 idea 路线:
-  17.4 (输出水平拼接 [Qhat|ds]@S_old/V_new, M=64 K=192): 5-12% 级, 非主路线
-  4 (A 下三角分块): 攻击 A@K/A@V 两 GEMM, 未验证
-  6 (GVA head fusion): G=4 共享 Q/K, 未验证
-★ 当前 93 分基线 (matw DV=128) 可能已是 MIG + tilelang 的实际性能上限.
-  110 分需 ~1.6x, 所有已验证路线 (WY-O/async/堆叠/SP-DV2/TMA/full-tile) 均无法兑现.
-  建议: 转向实验报告 (三轮 4-WG + WY-O 数学 + 堆叠 + SP-DV2 + state-only 证伪过程),
-  作为报告主要评分依据.
+  A (低 occupancy): 真, DV split 解法失败因 DV=64 TC 降级. 但 state-only 三 kernel (idea 18.6) 不需 DV split —
+    Kernel C output grid=chunks*DV_slices*B*Hv 巨大, DV=128 仍能填满 SM (long_low: 512*2*1*8=8192 CTA).
+  B (state critical path 长): 真, state-only 系数化缩短到 1 GEMM (C@S_old), 可行 (S0 已验证).
+  C (load 没进 pipeline): 假 (full-tile 退步). 但 idea 18.6 三 kernel 用 Kernel A 预计算 + Kernel C output
+    并行, load 在 Kernel A 里 grid=chunks*B*Hv 充分并行, 不依赖 T.Pipelined 重叠.
+★ 下一波: 按 idea 18.6 + 用户修正 (S_new 写新位置解耦 output) 实现三 kernel:
+  Kernel A: W/U/ds → C/B/P/R (grid=chunks*B*Hv, 并行)
+  Kernel B: S[c]=γr·S[c-1]-C@S[c-1]+B (grid=DV_slices*B*Hv, chunk 串行, 1 GEMM, 写 S_all[c+1])
+  Kernel C: O[c]=scale·(P@S[c-1]+R) (grid=chunks*DV_slices*B*Hv, 完全并行, 读 S_all[c])
 ```
+
 
 
