@@ -3778,9 +3778,7 @@ def gdn_prefill_forward(
                 block_DV=128, threads=256, num_stages=1,
             )
     elif num_tokens <= 2048:
-        # ★ 短序列: sweep 发现 matw DV=128 th=256 st=2 比结合律 DV=64 th=128 快
-        #   short_tail: 0.155 vs 0.198 (+22%), parallel_equal: 0.41 vs 0.41 (持平)
-        #   统一用 matw DV=128 (短序列也受益于大 tile + th=256 寄存器分摊)
+        # ★ 短序列: matw DV=128 th=256 st=2 (sweep 最优)
         kernel = _gdn_naive_kernel_matw(
             batch_size, num_tokens, num_heads_qk, num_heads_v,
             head_dim_k, head_dim_v,
@@ -3790,20 +3788,8 @@ def gdn_prefill_forward(
         # 长序列 per-case: 小 Hv (grid 不足) 用 DV=64 提占用, 大 Hv 用 DV=128 大 tile
         # OJ 实测: chain_equal(Hv=4) DV=64=0.53ms(94分) vs DV=128=0.84ms(74分)
         #          long_low/wide/deep/batch_split DV=128 最优
-        # ★ ncu: long_low reg=250, waves=0.57 (8 CTA / 14 SM, 不足 1 波), TC=15.6%.
-        #   250 reg/thread 限制占用率; waves 0.57 说明 SM 未填满 (grid=8 < 14 SM).
-        #   TC 15.6% 说明 GEMM 串行 + ew stall 主导, 非 TC 本身瓶颈.
-        # ★ GDN_DV64=1: 强制 DV=64 (grid 翻倍 16 CTA), 测试 SM 占用对 long_low 的影响.
         _grid = batch_size * num_heads_v
-        _force_dv64 = os.environ.get("GDN_DV64", "0") == "1"
-        if _force_dv64:
-            _dv64_th = 256 if os.environ.get("GDN_DV64_TH256", "0") == "1" else 128
-            kernel = _gdn_naive_kernel_matw(
-                batch_size, num_tokens, num_heads_qk, num_heads_v,
-                head_dim_k, head_dim_v,
-                block_DV=64, threads=_dv64_th, num_stages=2,
-            )
-        elif _grid <= 4:
+        if _grid <= 4:
             # chain(Hv=4)/hidden-2: 小 grid, DV=64 grid 翻倍提 SM 占用
             kernel = _gdn_naive_kernel_matw(
                 batch_size, num_tokens, num_heads_qk, num_heads_v,
@@ -3812,8 +3798,6 @@ def gdn_prefill_forward(
             )
         else:
             # ★ 大 grid (long_low/wide/deep/batch_split): DV=128 + num_stages=2
-            # 离线调参发现 st=2 比 st=1 快 ~6% (long_low 3.19→3.00ms).
-            # st=2 让 T.Pipelined 对 shared buffer 自动 multi-version, 跨 chunk load 重叠.
             kernel = _gdn_naive_kernel_matw(
                 batch_size, num_tokens, num_heads_qk, num_heads_v,
                 head_dim_k, head_dim_v,
